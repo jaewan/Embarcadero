@@ -1,4 +1,5 @@
 #include "chain_replication.h"
+#include "common/fault_injection.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -609,8 +610,8 @@ void ChainReplicationManager::ReplicationThread() {
                         return shutdown_workers.load(std::memory_order_acquire) ||
                                !pipe->token_q.empty();
                     });
+                    if (shutdown_workers.load(std::memory_order_acquire)) break;
                     if (pipe->token_q.empty()) {
-                        if (shutdown_workers.load(std::memory_order_acquire)) break;
                         continue;
                     }
                     // Peek head; only pop when token+CV stages complete.
@@ -623,9 +624,23 @@ void ChainReplicationManager::ReplicationThread() {
                 bool wait_recorded = false;
                 uint64_t wait_spins = 0;
                 while (!completed) {
+                    // Cancellation abandons unacknowledged work; never fabricate
+                    // a predecessor token or durability frontier to unblock Stop.
+                    if (shutdown_workers.load(std::memory_order_acquire)) return;
                     RefreshGOIToken(entry);
                     uint32_t token = entry->num_replicated.load(std::memory_order_acquire);
                     if (token < task.role) {
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+                        // Observation occurs outside token_mu; Stop can cancel this
+                        // wait without manufacturing predecessor completion.
+                        // Wait until all earlier stages except the immediate
+                        // predecessor are complete; otherwise a tail could hit
+                        // at token0 before the primary's legitimate token1.
+                        if (token + 1u == task.role &&
+                            !fault::Pause("replication.wait_predecessor",
+                                {entry->client_id, entry->session_epoch, entry->client_seq,
+                                 task.goi_index, token}, &shutdown_workers)) return;
+#endif
                         if (pipe->stats.first_blocking_goi.load(std::memory_order_relaxed) ==
                             UINT64_MAX) {
                             pipe->stats.first_blocking_goi.store(task.goi_index,
@@ -670,6 +685,13 @@ void ChainReplicationManager::ReplicationThread() {
                     }
 
                     if (token == task.role) {
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+                        // This task enters the token queue only after its actual
+                        // memory copy or disk sync completed. No synthetic token.
+                        if (!fault::Pause("replication.before_token_advance",
+                                {entry->client_id, entry->session_epoch, entry->client_seq,
+                                 task.goi_index, token}, &shutdown_workers)) return;
+#endif
                         uint32_t expected = static_cast<uint32_t>(task.role);
                         const uint32_t desired = static_cast<uint32_t>(task.role) + 1u;
                         if (entry->num_replicated.compare_exchange_strong(
@@ -792,9 +814,19 @@ void ChainReplicationManager::ReplicationThread() {
         LOG(INFO) << oss.str();
     };
 
+    // Allow normal drain, but a missing predecessor must not trap shutdown.
+    // This bounds protocol waiting, not an OS-blocked pwrite/fdatasync.
+    auto drain_deadline = std::chrono::steady_clock::time_point::max();
     while (true) {
         const bool stop_requested = stop_.load(std::memory_order_acquire);
         if (stop_requested) {
+            const auto now = std::chrono::steady_clock::now();
+            if (drain_deadline == std::chrono::steady_clock::time_point::max())
+                drain_deadline = now + std::chrono::seconds(1);
+            if (now >= drain_deadline) {
+                LOG(WARNING) << "Chain replication drain timed out; cancelling unacknowledged work";
+                break;
+            }
             const uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
             refresh_control_state(goi_index);
             const bool more_committed_goi =

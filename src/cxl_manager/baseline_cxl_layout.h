@@ -12,7 +12,8 @@ namespace Embarcadero::cxl_manager {
 // this value, so results from incompatible shared-memory layouts cannot mix.
 // v4 adds BatchHeader::original_client_batch_seq, required to keep Corfu
 // durable ValueId stable after token assignment rewrites batch_seq.
-inline constexpr uint32_t kCxlLayoutVersion = 4;
+// v5 publishes a region descriptor before followers may access shared metadata.
+inline constexpr uint32_t kCxlLayoutVersion = 5;
 inline constexpr size_t kControlBlockOffset = 0;
 inline constexpr size_t kCompletionVectorOffset = 0x1000;
 inline constexpr size_t kGOIOffset = 0x2000;

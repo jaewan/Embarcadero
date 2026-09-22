@@ -461,6 +461,14 @@ namespace Scalog {
 				return CreateErrorResponse(response, "Invalid request parameters", grpc::StatusCode::INVALID_ARGUMENT);
 			}
 
+            // This RPC promises pwrite+fdatasync completion. Memory mode uses
+            // the CXL polling/copy path and has no RPC writer workers.
+            if (log_to_memory_) {
+                return CreateErrorResponse(response,
+                    "durable replication RPC requires the disk sink",
+                    grpc::StatusCode::UNIMPLEMENTED);
+            }
+
 			// 3. Create WriteTask (copies data) and a completion that is fulfilled
 			// only after pwrite+fdatasync.
 			WriteTask task(*request);

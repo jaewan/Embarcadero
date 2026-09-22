@@ -1748,6 +1748,11 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 
 	// Calculate number of messages
 	size_t n = total_message_size / message_size;
+    const bool audited_ordered_delivery = ShouldValidateOrder() && order == 5;
+    if (audited_ordered_delivery && message_size < sizeof(uint64_t)) {
+        LOG(ERROR) << "Indexed ordered audit requires at least 8 payload bytes";
+        return {0.0, 0.0};
+    }
 
 	LOG(INFO) << "Starting end-to-end throughput test with " << n << " messages"
 		<< " (" << total_message_size << " bytes total)";
@@ -1783,6 +1788,7 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		// Initialize publisher (buffer allocation + network threads - not measured)
 		if (!p.Init(ack_level)) {
 			LOG(ERROR) << "Publisher::Init failed; aborting E2E test";
+			delete[] message;
 			return {0.0, 0.0};
 		}
 		
@@ -1811,14 +1817,21 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 
 		// Publish messages
 		for (size_t i = 0; i < n; i++) {
-			p.Publish(message, message_size);
+            if (audited_ordered_delivery) {
+                const uint64_t sequence = i;
+                std::memcpy(message, &sequence, sizeof(sequence));
+            }
+			p.Publish(message, message_size); // Copies payload before the next index is written.
 		}
 
 		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
 		if (!p.Poll(n, false)) {
 			LOG(ERROR) << "End-to-end test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
-			exit(1);
+			// Return through the local publisher/subscriber destructors so their
+			// workers stop before process-global transport/test controls disappear.
+			// main converts this unsuccessful result to EXIT_FAILURE.
+			return {0.0, 0.0};
 		}
 
 		// Record publish end time
@@ -1830,7 +1843,15 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		// All order levels now use efficient passive polling
 		// Sequencer 5 logical reconstruction happens in receiver threads
 		VLOG(3) << "Using passive polling for order level " << order;
-		s.Poll(total_message_size, message_size);
+        if (audited_ordered_delivery) {
+            if (!s.AuditOrderedDelivery(n, message, message_size, 20000, true)) {
+                LOG(ERROR) << "End-to-end ordered delivery audit failed";
+                delete[] message;
+                return {0.0, 0.0};
+            }
+        } else {
+            s.Poll(total_message_size, message_size);
+        }
 
 		// Record end-to-end end time
 		auto end = std::chrono::high_resolution_clock::now();
@@ -1845,9 +1866,11 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 
 		// Check message ordering (add small delay to ensure buffers are stable)
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		if (ShouldValidateOrder()) {
-			s.DEBUG_check_order(order);
-		}
+        if (ShouldValidateOrder() && !audited_ordered_delivery && !s.DEBUG_check_order(order)) {
+            LOG(ERROR) << "End-to-end retained-header audit failed";
+            delete[] message;
+            return {0.0, 0.0};
+        }
 
 		LOG(INFO) << "Publish completed in " << std::fixed << std::setprecision(2) 
 			<< pub_seconds << " seconds, " << pubBandwidthMbps << " MB/s";

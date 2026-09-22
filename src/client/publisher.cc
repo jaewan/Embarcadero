@@ -9,6 +9,8 @@
 #include "common/config.h"
 #include "common/order_level.h"
 #include "common/scoped_fd.h"
+#include "common/fault_injection.h"
+#include "network_manager/protocol.h"
 #include "session.pb.h"
 #include "absl/container/flat_hash_map.h"
 #include <cstring>
@@ -29,13 +31,10 @@
 #include <stdexcept>
 
 namespace {
-constexpr uint32_t kSessionControlMagic = 0x53455346U;  // "SESF"
+using Embarcadero::network::kSessionControlMagic;
+using Embarcadero::network::SessionControlHeader;
 constexpr uint32_t kMaxSessionControlPayload = 64 * 1024;
 
-struct SessionControlHeader {
-	uint32_t magic;
-	uint32_t length;
-};
 
 uint32_t ReadSessionEpochOverride() {
 	const char* env = std::getenv("EMBARCADERO_SESSION_EPOCH");
@@ -836,6 +835,10 @@ bool Publisher::SendSessionOpenOnSocket(
 	          << " committed_hwm=" << ack.committed_hwm()
 	          << " has_committed_prefix=" << (ack.has_committed_prefix() ? 1 : 0)
 	          << " status=" << ack.status();
+    if (ack.status() == embarcadero::session::SessionOpenAck::RESOURCE_EXHAUSTED) {
+        LOG(ERROR) << "Session OPEN rejected: broker authoritative state is full/unavailable";
+        return false;
+    }
 	if (ack.status() == embarcadero::session::SessionOpenAck::FENCED ||
 	    ack.status() == embarcadero::session::SessionOpenAck::EPOCH_STALE) {
 		// Auxiliary retransmit sockets are opened while retransmit_send_mu_ is
@@ -1366,6 +1369,11 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 
 	const uint32_t old_epoch = session_epoch_.load(std::memory_order_acquire);
 	const uint32_t new_epoch = NextSessionEpochAfterFence(old_epoch);
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+    if (!Embarcadero::fault::Pause("session.before_reopen",
+            {static_cast<uint64_t>(client_id_), old_epoch, new_epoch,
+             fenced.has_committed_prefix() ? 1ULL : 0ULL, fenced.committed_msg_hwm()}, &shutdown_)) return;
+#endif
 	session_fenced_observed_.fetch_add(1, std::memory_order_relaxed);
 	// [[FENCE_POLL_EXIT]] Record the first fence observation time so Poll() can
 	// bound the post-fence ACK wait regardless of trickle ACKs from survivors.
@@ -2058,6 +2066,13 @@ void Publisher::WritePublishLatencyResults() {
 
 
 bool Publisher::Init(int ack_level) {
+#ifdef EMBARCADERO_CLIENT_NO_BASELINES
+    if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO) {
+        LOG(ERROR) << "Baseline support was disabled when this client was built.";
+        return false;
+    }
+#endif
+
 	ack_level_ = ack_level;
 
 	const auto& runtime_cfg = Embarcadero::GetConfig().config().client.runtime;
@@ -2948,6 +2963,11 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
 			return false;
 		}
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+            if (!Embarcadero::fault::Pause("poll.after_ack_snapshot",
+                    {static_cast<uint64_t>(client_id_), session_epoch_.load(), normalized_received,
+                     received, target_acks}, &shutdown_)) return false;
+#endif
 			ack_wait_done_time = std::chrono::steady_clock::now();
 			LOG(INFO) << "[ACK_VERIFY] normalized_received=" << normalized_received
 			          << " raw_received=" << received
@@ -3660,6 +3680,11 @@ process_client_fd:;
 						// We must handle first ACK specially: new_acked_msgs = acked_msg (not acked_msg - (-1))
 						size_t new_acked_msgs;
 						if (IsOrder5SessionMode()) {
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+                            if (!Embarcadero::fault::Pause("ack.before_authoritative_hwm",
+                                    {static_cast<uint64_t>(client_id_), session_epoch_.load(), session_global_acked,
+                                     order5_last_ack_hwm_.load(), ack_received_.load()}, &shutdown_)) return;
+#endif
 							size_t global_prev = order5_last_ack_hwm_.load(std::memory_order_acquire);
 							while (session_global_acked > global_prev &&
 							       !order5_last_ack_hwm_.compare_exchange_weak(
@@ -3674,6 +3699,15 @@ process_client_fd:;
 							// Subsequent ACK - calculate increment from previous
 							new_acked_msgs = session_global_acked - prev_acked;
 						}
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+                        if (IsOrder5SessionMode() && new_acked_msgs > 0) {
+                            size_t bytes;
+                            { std::lock_guard<std::mutex> lock(unacked_mu_); bytes = unacked_bytes_; }
+                            if (!Embarcadero::fault::Pause("ack.after_authoritative_hwm",
+                                    {static_cast<uint64_t>(client_id_), session_epoch_.load(), session_global_acked,
+                                     ack_received_.load(), bytes}, &shutdown_)) return;
+                        }
+#endif
 						if (new_acked_msgs > 0) {
 #ifdef COLLECT_LATENCY_STATS
 								ProcessPublishAckLatency(broker_id, session_global_acked);
@@ -3683,6 +3717,16 @@ process_client_fd:;
 								prev_ack_per_sock[client_sock] = session_global_acked; // Update last value for this socket
 								CompleteUnackedThrough(broker_id, session_global_acked);
 								ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+                                if (IsOrder5SessionMode()) {
+                                    size_t bytes, batches;
+                                    { std::lock_guard<std::mutex> lock(unacked_mu_);
+                                      bytes = unacked_bytes_; batches = unacked_batches_.size(); }
+                                    if (!Embarcadero::fault::Pause("ack.after_retirement",
+                                            {static_cast<uint64_t>(client_id_), session_epoch_.load(), session_global_acked,
+                                             bytes, batches}, &shutdown_)) return;
+                                }
+#endif
 							} else {
 							// Duplicate cumulative value, ignore.
 							VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << 

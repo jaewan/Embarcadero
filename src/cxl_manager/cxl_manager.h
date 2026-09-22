@@ -13,6 +13,7 @@
 #include <heartbeat.grpc.pb.h>
 #include "embarlet/heartbeat.h"
 #include "cxl_datastructure.h"
+#include "region_layout.h"
 #include "embarlet/topic_manager.h"
 #include "network_manager/network_manager.h"
 #include "common/performance_utils.h"
@@ -115,6 +116,8 @@ class CXLManager{
 		int broker_id_;
 		std::string head_ip_;
 		size_t cxl_size_;
+		cxl_manager::RegionLayout layout_{};
+        std::atomic<size_t> batch_header_log_count_{0};
 		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;
@@ -137,7 +140,7 @@ class CXLManager{
 		SessionEntry* session_table_;
 		void* segments_;
 		void* current_log_addr_;
-		volatile bool stop_threads_ = false;
+		std::atomic<bool> stop_threads_{false};
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 		
 		// [[DEVIATION_005]] Future Multi-Node CXL Support: SegmentAllocator Abstraction

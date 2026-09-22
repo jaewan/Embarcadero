@@ -163,7 +163,7 @@ int main(int argc, char* argv[]) {
 	std::signal(SIGPIPE, SIG_IGN);
 
 	// Parse command line arguments
-	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
+	std::string head_addr;
 	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
 
 	options.add_options()
@@ -178,6 +178,13 @@ int main(int argc, char* argv[]) {
 		("embarcadero", "Run as a Embarcadero Replica")
 		("EMBARCADERO", "Run as a Embarcadero Replica")
 		("e,emul", "Use emulation instead of CXL")
+        ("print-layout", "Print validated shared-region layout as JSON and exit")
+        ("broker-port", "Broker data port", cxxopts::value<int>())
+        ("heartbeat-interval", "Heartbeat interval", cxxopts::value<int>())
+        ("cxl-size", "Region bytes", cxxopts::value<size_t>())
+        ("batch-size", "Batch bytes", cxxopts::value<size_t>())
+        ("max-topics", "Topic capacity", cxxopts::value<int>())
+        ("network-threads", "Network thread override", cxxopts::value<int>())
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("network_threads", "Number of network IO threads",
 		 cxxopts::value<int>()->default_value(std::to_string(NUM_NETWORK_IO_THREADS)))
@@ -204,8 +211,27 @@ int main(int argc, char* argv[]) {
 	}
 	
 	// Override configuration with command line arguments
-	config.overrideFromCommandLine(argc, argv);
+	try {
+        config.overrideFromCommandLine(argc, argv);
+        if (!config.finalize()) {
+            for (const auto& error : config.getValidationErrors()) LOG(ERROR) << error;
+            return EXIT_FAILURE;
+        }
+        const auto layout = Embarcadero::cxl_manager::CalculateRegionLayout(config.config());
+        if (arguments.count("print-layout")) {
+            std::cout << "{\"region_bytes\":" << layout.region_bytes
+                << ",\"metadata_bytes\":" << layout.metadata_bytes
+                << ",\"payload_bytes\":" << layout.payload_bytes
+                << ",\"segment_size\":" << layout.segment_size
+                << ",\"segment_count\":" << layout.segment_count << "}\n";
+            return EXIT_SUCCESS;
+        }
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Invalid effective configuration: " << e.what();
+        return EXIT_FAILURE;
+    }
 	
+	head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
 	LOG(INFO) << "Configuration loaded successfully from " << config_file;
 
 	// *************** Initializing Broker ********************** 
@@ -299,18 +325,7 @@ int main(int argc, char* argv[]) {
 		LOG(WARNING) << "Using emulated CXL";
 	}
 
-	int num_network_io_threads = config.getNetworkIOThreads();
-	// cxxopts always materializes a default for --network_threads (compiled before
-	// YAML load), so only honor an explicit argv flag. Env
-	// EMBARCADERO_NETWORK_IO_THREADS and YAML io_threads flow through getNetworkIOThreads().
-	for (int i = 1; i < argc; ++i) {
-		const std::string arg = argv[i] ? argv[i] : "";
-		if (arg == "--network_threads" || arg.rfind("--network_threads=", 0) == 0 ||
-		    arg == "--network-threads" || arg.rfind("--network-threads=", 0) == 0) {
-			num_network_io_threads = arguments["network_threads"].as<int>();
-			break;
-		}
-	}
+	const int num_network_io_threads = config.getNetworkIOThreads();
 	// Resolve effective runtime settings once after YAML/env/CLI merge and log them.
 	const auto failure_domain = Embarcadero::DefaultSingleHostDomain();
 	LOG(INFO) << "[EFFECTIVE_CONFIG]"
@@ -349,7 +364,16 @@ int main(int argc, char* argv[]) {
 	                  : "0");
 
 	// Create and connect all manager components
-		Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_ip);
+        std::unique_ptr<Embarcadero::CXLManager> cxl_manager_owner;
+        try {
+            cxl_manager_owner = std::make_unique<Embarcadero::CXLManager>(broker_id, cxl_type, head_ip);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Shared-region startup failed for broker " << broker_id << ": " << error.what();
+            heartbeat_manager.RequestShutdown();
+            if (corfu_token_proxy) corfu_token_proxy->Shutdown();
+            return EXIT_FAILURE;
+        }
+        auto& cxl_manager = *cxl_manager_owner;
 		if (cxl_manager.GetCXLAddr() == nullptr) {
 			LOG(ERROR) << "CXL initialization failed for broker " << broker_id << ", aborting startup";
 			return EXIT_FAILURE;
@@ -394,8 +418,17 @@ int main(int argc, char* argv[]) {
 			                  ? std::getenv("EMBARCADERO_REPLICATION_FACTOR")
 			                  : "0");
 		}
-		Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
-				replicate_to_memory, sequencerType);
+        std::unique_ptr<Embarcadero::DiskManager> disk_manager_owner;
+        try {
+            disk_manager_owner = std::make_unique<Embarcadero::DiskManager>(broker_id,
+                cxl_manager.GetCXLAddr(), replicate_to_memory, sequencerType);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Replication startup failed for broker " << broker_id << ": " << error.what();
+            heartbeat_manager.RequestShutdown();
+            if (corfu_token_proxy) corfu_token_proxy->Shutdown();
+            return EXIT_FAILURE;
+        }
+        auto& disk_manager = *disk_manager_owner;
 		LOG(INFO) << "[CORFU_DEBUG] DiskManager constructed";
 	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
@@ -439,6 +472,11 @@ int main(int argc, char* argv[]) {
 	network_manager.SetDiskManager(&disk_manager);
 	network_manager.SetTopicManager(&topic_manager);
 
+    // Publish the discovery admission callback only after all manager links and
+    // callbacks are installed; the follower discovery thread starts in its constructor.
+    topic_manager.RegisterGetLiveBrokerIdsCallback(
+        [&heartbeat_manager]() { return heartbeat_manager.GetLiveBrokerIds(); });
+
 	LOG(INFO) << "[CORFU_DEBUG] Managers connected, waiting for data port to listen";
 
 	// Only signal "ready" when the data port is actually listening.
@@ -454,6 +492,8 @@ int main(int argc, char* argv[]) {
 	}
 	if (!network_manager.IsListening()) {
 		LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
+        // Drain RPCs that hold the TopicManager callback before destroying topics.
+        heartbeat_manager.RequestShutdown();
 		network_manager.Shutdown();
 		topic_manager.Shutdown();
 		if (corfu_token_proxy) corfu_token_proxy->Shutdown();

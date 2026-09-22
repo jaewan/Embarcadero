@@ -1,4 +1,6 @@
 include(cmake/heartbeat_grpc.cmake)
+if(EMBARCADERO_BUILD_BROKER OR EMBARCADERO_BUILD_BASELINE_TOOLS OR
+   EMBARCADERO_CLIENT_BASELINES OR EMBARCADERO_BUILD_BENCHMARKS OR BUILD_TESTING)
 include(cmake/scalog_sequencer_grpc.cmake)
 include(cmake/lazylog_sequencer_grpc.cmake)
 include(cmake/lazylog_metadata_grpc.cmake)
@@ -6,6 +8,7 @@ include(cmake/corfu_sequencer_grpc.cmake)
 include(cmake/corfu_token_proxy_grpc.cmake)
 include(cmake/scalog_replication_grpc.cmake)
 include(cmake/corfu_replication_grpc.cmake)
+endif()
 include(cmake/session_proto.cmake)
 
 find_package(folly REQUIRED)
@@ -17,14 +20,6 @@ find_package(cxxopts REQUIRED)
 
 # Detect the processor type
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-    # Check for Intel specific intrinsics
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-    if(COMPILER_SUPPORTS_MARCH_NATIVE)
-        message(STATUS "Enabling -march=native")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
-    endif()
-
     # Detect Intel or AMD processor using lscpu
     execute_process(
         COMMAND lscpu
@@ -46,9 +41,15 @@ endif()
 
 configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
+# Shared immutable configuration/parser implementation. Keep the boundary narrow:
+# no generated RPC headers, storage, or runtime worker dependencies.
+add_library(embarcadero_configuration STATIC common/configuration.cc)
+target_include_directories(embarcadero_configuration PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(embarcadero_configuration PRIVATE yaml-cpp glog::glog)
+
+if(EMBARCADERO_BUILD_BROKER)
 add_executable(embarlet
     embarlet/embarlet.cc
-    common/configuration.cc
     common/configuration.h
     common/baseline_control_transport.cc
     common/baseline_control_transport.h
@@ -86,6 +87,7 @@ add_executable(embarlet
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
     embarlet/topic.cc
+    embarlet/topic_session.cc
 	embarlet/goi_recovery_thread.cc
     embarlet/topic.h
 )
@@ -98,6 +100,7 @@ target_include_directories(embarlet PUBLIC
 )
 
 target_link_libraries(embarlet
+    embarcadero_configuration
     atomic
     numa
     glog::glog
@@ -126,8 +129,20 @@ set_target_properties(embarlet PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+endif()
+
 # Enable benchmark optimizations for embarlet (commented out due to segfault)
 # target_compile_definitions(embarlet PRIVATE BUILDING_ORDER_BENCH)
+
+if(EMBARCADERO_ENABLE_FAULT_INJECTION)
+    add_library(embarcadero_fault_injection STATIC common/fault_injection.cc)
+    target_include_directories(embarcadero_fault_injection PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(embarcadero_fault_injection PUBLIC EMBARCADERO_ENABLE_FAULT_INJECTION=1)
+    target_link_libraries(embarcadero_fault_injection PUBLIC Threads::Threads)
+    if(TARGET embarlet)
+        target_link_libraries(embarlet embarcadero_fault_injection)
+    endif()
+endif()
 
 add_executable(throughput_test
     client/common.cc
@@ -145,7 +160,6 @@ add_executable(throughput_test
     client/test_utils.cc
     client/test_utils.h
     client/main.cc
-    common/configuration.cc
     common/configuration.h
     # [[GLIBC_COMPAT]] Provide __isoc23_strtoul etc. locally so binaries
     # compiled on GLIBC 2.39 (Ubuntu 24.04) run on GLIBC 2.35 (Ubuntu 22.04).
@@ -160,20 +174,13 @@ target_include_directories(throughput_test PUBLIC
 )
 
 target_link_libraries(throughput_test
+    embarcadero_configuration
     glog::glog
     gflags
     mimalloc
     cxxopts::cxxopts
     heartbeat_grpc_proto
     session_proto
-    # topic.h includes the LazyLog metadata-replica client through the shared
-    # CXL manager headers.  Keep its generated headers available for a clean
-    # throughput_test build, not only for embarlet.
-    lazylog_metadata_grpc_proto
-    corfu_sequencer_grpc_proto
-    corfu_token_proxy_grpc_proto
-    corfu_replication_grpc_proto
-    scalog_replication_grpc_proto
     grpc++_reflection
     grpc++
     protobuf::libprotobuf
@@ -181,6 +188,15 @@ target_link_libraries(throughput_test
     Threads::Threads
     yaml-cpp
 )
+
+if(EMBARCADERO_ENABLE_FAULT_INJECTION)
+    target_link_libraries(throughput_test embarcadero_fault_injection)
+endif()
+if(EMBARCADERO_CLIENT_BASELINES)
+    target_link_libraries(throughput_test corfu_token_proxy_grpc_proto)
+else()
+    target_compile_definitions(throughput_test PRIVATE EMBARCADERO_CLIENT_NO_BASELINES=1)
+endif()
 
 set_target_properties(throughput_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
@@ -191,6 +207,7 @@ set_target_properties(throughput_test PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
 )
 
+if(EMBARCADERO_BUILD_BENCHMARKS)
 # Buffer-only throughput benchmark (no network). Isolates pubQue_/Buffer for serialization investigation.
 add_executable(buffer_benchmark
     client/common.cc
@@ -213,6 +230,11 @@ target_include_directories(buffer_benchmark PUBLIC
 )
 
 target_link_libraries(buffer_benchmark
+    # common.h currently exposes these generated headers transitively.
+    lazylog_metadata_grpc_proto
+    corfu_token_proxy_grpc_proto
+    corfu_replication_grpc_proto
+    scalog_replication_grpc_proto
     glog::glog
     gflags
     mimalloc
@@ -231,6 +253,9 @@ set_target_properties(buffer_benchmark PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+endif()
+
+if(EMBARCADERO_BUILD_BASELINE_TOOLS)
 add_executable(scalog_global_sequencer
     cxl_manager/scalog_global_sequencer.cc
     cxl_manager/scalog_global_sequencer.h
@@ -580,6 +605,8 @@ add_mailbox_global_sequencer(lazylog_mailbox_global_sequencer 3
     cxl_manager/lazylog_mailbox_sequencer.cc
     cxl_manager/lazylog_binding_core.cc)
 
+
+endif()
 
 # ---- CXL mailbox transport (Track 03 / W4) ----
 # Shared-memory RPC substrate built from our own single-writer rings + clwb/sfence.

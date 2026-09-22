@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include "common/ack_rf_policy.h"
+#include "common/support_contract.h"
 #include "common/performance_utils.h"
 #include "common/order_level.h"
 
@@ -13,6 +14,42 @@
 #include "disk_manager/disk_manager.h"
 
 namespace Embarcadero {
+
+static_assert(static_cast<int>(SupportedSequencer::Embarcadero) == heartbeat_system::EMBARCADERO);
+static_assert(static_cast<int>(SupportedSequencer::Kafka) == heartbeat_system::KAFKA);
+static_assert(static_cast<int>(SupportedSequencer::Scalog) == heartbeat_system::SCALOG);
+static_assert(static_cast<int>(SupportedSequencer::Corfu) == heartbeat_system::CORFU);
+static_assert(static_cast<int>(SupportedSequencer::LazyLog) == heartbeat_system::LAZYLOG);
+
+bool TopicManager::ValidateTopicAdmission(int order, int rf, int ack,
+                                        heartbeat_system::SequencerType sequencer, int* live_count) {
+    const char* scalog = std::getenv("SCALOG_CXL_MODE");
+    auto validation = ValidateSupportedMode(
+        {static_cast<SupportedSequencer>(sequencer), order, ack, rf},
+        scalog && std::strcmp(scalog, "1") == 0);
+    if (!validation.ok) {
+        LOG(ERROR) << "Topic admission rejected: " << validation.error;
+        return false;
+    }
+    std::function<std::vector<int>()> membership;
+    {
+        std::lock_guard<std::mutex> lock(membership_callback_mutex_);
+        membership = get_live_broker_ids_callback_;
+    }
+    const auto live_ids = membership ? membership() : std::vector<int>{};
+    validation = ValidateReplicationTopology(rf, NUM_MAX_BROKERS_CONFIG, live_ids);
+    if (!validation.ok) {
+        LOG_EVERY_N(ERROR, 100) << "Topic admission rejected: " << validation.error;
+        return false;
+    }
+    std::string error;
+    if (!disk_manager_.ValidateTopicReplication(order, rf, static_cast<int>(live_ids.size()), sequencer, error)) {
+        LOG(ERROR) << "Topic admission rejected: " << error;
+        return false;
+    }
+    if (live_count) *live_count = static_cast<int>(live_ids.size());
+    return true;
+}
 
 constexpr uint64_t kReplicationNotStarted = std::numeric_limits<uint64_t>::max();
 
@@ -131,6 +168,8 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 
 struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE]) {
 	if (shutting_down_.load(std::memory_order_acquire)) return nullptr;
+	if (!topic || strnlen(topic, TOPIC_NAME_SIZE) == 0 ||
+        strnlen(topic, TOPIC_NAME_SIZE) == TOPIC_NAME_SIZE) return nullptr;
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	TInode* replica_tinode = nullptr;
 
@@ -139,16 +178,33 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		LOG(ERROR) << "TInode not properly initialized for topic: " << topic;
 		return nullptr;
 	}
+    // A slot hash is not an identity check. A follower's first local attachment
+    // must match the head's shared name even before its admission gate is set.
+    if (strncmp(tinode->topic, topic, TOPIC_NAME_SIZE) != 0) {
+        LOG(ERROR) << "Shared TInode belongs to a different topic; rejecting " << topic;
+        return nullptr;
+    }
+    int admitted_brokers = 0;
+    if (!ValidateTopicAdmission(tinode->order, tinode->replication_factor,
+                                tinode->ack_level, tinode->seq_type, &admitted_brokers)) return nullptr;
+    if (tinode->replicate_tinode && MAX_TOPIC_SIZE < 2) {
+        LOG(ERROR) << "TInode replication requires two metadata slots";
+        return nullptr;
+    }
 
 	{
 		absl::WriterMutexLock lock(&topics_mutex_);
 
-		CHECK_LT(num_topics_, MAX_TOPIC_SIZE)
-			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
+        if (!topic_admission_.TryAdmit(topic)) {
+            LOG_EVERY_N(ERROR, 100) << "Only one topic per shared region is supported; rejecting " << topic;
+            return nullptr;
+        }
 
 		if (topics_.find(topic) != topics_.end()) {
 			return nullptr;
 		}
+		CHECK_LT(num_topics_, MAX_TOPIC_SIZE)
+			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
 
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
 		void* segment_metadata = nullptr;
@@ -233,11 +289,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		// LazyLog/Scalog use their own replica managers, so applying this check
 		// there incorrectly reports a missing Embarcadero chain for valid RF>0
 		// baseline topics.
-		if (tinode->seq_type == EMBARCADERO) {
-			disk_manager_.EnsureTopicReplicationFactor(replication_factor);
-		}
 		if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
-			disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
+			if (!disk_manager_.Replicate(tinode, replica_tinode, replication_factor, admitted_brokers)) return nullptr;
 		}
 
 		// Run sequencer if needed
@@ -316,42 +369,21 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		int ack_level,
 		SequencerType seq_type) {
 	if (shutting_down_.load(std::memory_order_acquire)) return nullptr;
+	if (!topic || strnlen(topic, TOPIC_NAME_SIZE) == 0 ||
+        strnlen(topic, TOPIC_NAME_SIZE) == TOPIC_NAME_SIZE) return nullptr;
+    if (replicate_tinode && MAX_TOPIC_SIZE < 2) {
+        LOG(ERROR) << "TInode replication requires two metadata slots";
+        return nullptr;
+    }
 
 	LOG(INFO) << "CreateNewTopicInternal: topic=" << topic << " order=" << order 
 	          << " replication_factor=" << replication_factor << " ack_level=" << ack_level;
-	if (seq_type == CORFU && order != kOrderTotal) {
-		LOG(ERROR) << "CreateNewTopicInternal: Corfu supports only ORDER=2 (topic='"
-		           << topic << "', order=" << order << ")";
-		return nullptr;
-	}
-	if (seq_type == LAZYLOG && order != kOrderTotal) {
-		LOG(ERROR) << "CreateNewTopicInternal: LazyLog baseline requires ORDER=2 (topic='"
-		           << topic << "', order=" << order << ")";
-		return nullptr;
-	}
-	{
-		const auto ack_rf = ValidateAckReplicationPolicy(ack_level, replication_factor);
-		if (!ack_rf.ok) {
-			LOG(ERROR) << "CreateNewTopicInternal: " << ack_rf.error
-			           << " (topic='" << topic << "', sequencer=" << seq_type << ")";
-			return nullptr;
-		}
-	}
-	if (seq_type == SCALOG && ack_level == 2) {
-		// Scalog ACK2 tracks durability via the CXL replication path.
-		// Running ACK2 without SCALOG_CXL_MODE causes non-progressing ACK frontiers.
-		const char* scalog_cxl_mode = std::getenv("SCALOG_CXL_MODE");
-		const bool scalog_cxl_enabled =
-			(scalog_cxl_mode != nullptr && scalog_cxl_mode[0] == '1' && scalog_cxl_mode[1] == '\0');
-		if (!scalog_cxl_enabled) {
-			LOG(ERROR) << "CreateNewTopicInternal: Scalog ACK2 requires SCALOG_CXL_MODE=1 "
-			           << "(topic='" << topic << "').";
-			return nullptr;
-		}
-	}
+    int admitted_brokers = 0;
+    if (!ValidateTopicAdmission(order, replication_factor, ack_level, seq_type, &admitted_brokers)) return nullptr;
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;
+	if (!tinode) return nullptr;
 
 	// Check for name collision in tinode: if already set to a different name, abort
 	if (tinode->topic[0] != 0 && strncmp(tinode->topic, topic, TOPIC_NAME_SIZE) != 0) {
@@ -362,12 +394,20 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	{
 		absl::WriterMutexLock lock(&topics_mutex_);
 
+        if (!topic_admission_.TryAdmit(topic)) {
+            LOG(ERROR) << "Only one topic per shared region is supported; rejecting " << topic;
+            return nullptr;
+        }
+
+        if (topics_.find(topic) != topics_.end()) {
+            if (tinode->order == order && tinode->replication_factor == replication_factor &&
+                tinode->seq_type == seq_type && tinode->replicate_tinode == replicate_tinode && tinode->ack_level == ack_level)
+                return tinode;
+            LOG(ERROR) << "Existing topic mode differs from create request: " << topic;
+            return nullptr;
+        }
 		CHECK_LT(num_topics_, MAX_TOPIC_SIZE)
 			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
-
-		if (topics_.find(topic) != topics_.end()) {
-			return nullptr;
-		}
 
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
 		void* segment_metadata = nullptr;
@@ -490,11 +530,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	}
 
 	// Handle replication if needed
-	if (tinode->seq_type == EMBARCADERO) {
-		disk_manager_.EnsureTopicReplicationFactor(replication_factor);
-	}
 	if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
-		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
+		if (!disk_manager_.Replicate(tinode, replica_tinode, replication_factor, admitted_brokers)) return nullptr;
 	}
 	// Run sequencer if needed
 	if (tinode->seq_type == SCALOG) {
@@ -571,35 +608,17 @@ bool TopicManager::CreateNewTopic(
         int ack_level,
         heartbeat_system::SequencerType seq_type) {
 	if (shutting_down_.load(std::memory_order_acquire)) return false;
-	if (seq_type == CORFU && order != kOrderTotal) {
-		LOG(ERROR) << "CreateNewTopic: Corfu supports only ORDER=2 (topic='"
-		           << topic << "', order=" << order << ")";
-		return false;
-	}
-	if (seq_type == LAZYLOG && order != kOrderTotal) {
-		LOG(ERROR) << "CreateNewTopic: LazyLog baseline requires ORDER=2 (topic='"
-		           << topic << "', order=" << order << ")";
-		return false;
-	}
-	
+    if (!topic || strnlen(topic, TOPIC_NAME_SIZE) == 0 ||
+        strnlen(topic, TOPIC_NAME_SIZE) == TOPIC_NAME_SIZE ||
+        !ValidateTopicAdmission(order, replication_factor, ack_level, seq_type)) return false;
+
 	// Direct call without string interning overhead
 	struct TInode* tinode = CreateNewTopicInternal(
 		topic, order, replication_factor, 
 		replicate_tinode, ack_level, seq_type);
 		
-	if (tinode) {
-		return true;
-	} else {
-		// If topic is already in the map a second client is connecting to an existing topic;
-		// treat as success (idempotent create) so multi-client benchmarks work.
-		absl::ReaderMutexLock lock(&topics_mutex_);
-		if (topics_.find(topic) != topics_.end()) {
-			LOG(INFO) << "Topic already exists, returning success for concurrent client: " << topic;
-			return true;
-		}
-		LOG(ERROR) << "Topic creation failed for: " << topic;
-		return false;
-	}
+    if (!tinode) LOG(ERROR) << "Topic creation failed for: " << topic;
+    return tinode != nullptr;
 }
 
 void TopicManager::DeleteTopic(const char topic[TOPIC_NAME_SIZE]) {

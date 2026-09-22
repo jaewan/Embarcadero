@@ -595,6 +595,61 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 
 } // namespace
 
+bool Subscriber::AuditOrderedDelivery(size_t expected_messages, const void* expected_payload,
+                                      size_t payload_size, int timeout_ms, bool indexed_payload) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    size_t received = 0;
+    size_t payload_bytes = 0;
+    bool valid = expected_messages > 0 && expected_payload && payload_size > 0 &&
+                 (!indexed_payload || payload_size >= sizeof(uint64_t));
+    std::vector<OrderedMessageView> messages;
+    while (valid && received < expected_messages && std::chrono::steady_clock::now() < deadline) {
+        ConsumeOrderedBatch(&messages, std::min(size_t{256}, expected_messages - received), 20);
+        for (const auto& message : messages) {
+            uint64_t order = 0;
+            const uint8_t* payload = nullptr;
+            if (message.wire_header_version == Embarcadero::wire::HEADER_VERSION_V2) {
+                const auto* h = static_cast<const Embarcadero::BlogMessageHeader*>(message.data);
+                valid = h->size == payload_size;
+                order = h->total_order;
+                payload = reinterpret_cast<const uint8_t*>(h) + sizeof(*h);
+            } else {
+                const auto* h = static_cast<const Embarcadero::MessageHeader*>(message.data);
+                valid = h->size == payload_size && h->paddedSize >= sizeof(*h) &&
+                        payload_size <= h->paddedSize - sizeof(*h);
+                order = h->total_order;
+                payload = reinterpret_cast<const uint8_t*>(h) + sizeof(*h);
+            }
+            const size_t tag_bytes = indexed_payload ? sizeof(uint64_t) : 0;
+            uint64_t sequence = received;
+            if (valid && indexed_payload) std::memcpy(&sequence, payload, sizeof(sequence));
+            if (!valid || order != received || sequence != received ||
+                std::memcmp(payload + tag_bytes,
+                            static_cast<const uint8_t*>(expected_payload) + tag_bytes,
+                            payload_size - tag_bytes) != 0) {
+                valid = false;
+                break;
+            }
+            ++received;
+            payload_bytes += payload_size;
+        }
+    }
+    size_t parsed, duplicates;
+    { absl::MutexLock lock(&consume_mutex_);
+      parsed = ordered_received_messages_;
+      duplicates = ordered_duplicate_messages_; }
+    const auto errors = ordered_parse_errors_.load(std::memory_order_relaxed);
+    const auto gaps = GetOrderedExportGapsReported();
+    valid = valid && received == expected_messages && parsed == expected_messages &&
+            duplicates == 0 && errors == 0 && gaps == 0;
+    LOG(INFO) << "[ORDERED_DELIVERY_AUDIT] status=" << (valid ? "passed" : "failed")
+              << " messages=" << received << " expected=" << expected_messages
+              << " payload_bytes=" << payload_bytes << " duplicates=" << duplicates
+              << " parse_errors=" << errors << " export_gaps=" << gaps
+              << " indexed_payload=" << (indexed_payload ? 1 : 0);
+    return valid;
+}
+
 bool Subscriber::DEBUG_check_order(int order) {
 	// 1. Aggregate all message headers from all connection buffers (V1 and V2)
 	std::vector<HeaderValidationData> all_headers;
@@ -740,7 +795,7 @@ bool Subscriber::DEBUG_check_order(int order) {
 
 	if (all_headers.empty()) {
 		LOG(WARNING) << "DEBUG_check_order: No message headers found to validate";
-		return true; // No messages to check
+		return false; // Empty retained buffers cannot establish ordered delivery.
 	}
 
 	// Deduplicate headers to avoid reprocessing duplicates across buffers
@@ -1647,8 +1702,10 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 	const int64_t flush_deadline_us = DeliveryFlushDeadlineUs(flush_measurement_mode);
 	const int64_t receiver_cv_wait_us = ReceiverCvWaitUs();
 	const bool delivery_diag_enabled = (std::getenv("EMBARCADERO_SUBSCRIBER_DIAG") != nullptr);
+    const char* audit_env = std::getenv("EMBAR_VALIDATE_ORDER");
+    const bool audit_ordered_delivery = audit_env && std::strcmp(audit_env, "0") != 0;
 	const bool force_ordered_consume_stream =
-		(std::getenv("EMBARCADERO_ENABLE_ORDERED_CONSUME_STREAM") != nullptr ||
+		(audit_ordered_delivery || std::getenv("EMBARCADERO_ENABLE_ORDERED_CONSUME_STREAM") != nullptr ||
 		 std::getenv("EMBARCADERO_DELIVERY_MEASURE") != nullptr);
 	const bool feed_ordered_consume_stream =
 		(order_level_ >= 1 &&
@@ -1734,7 +1791,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				validate_order_env && std::strcmp(validate_order_env, "0") != 0;
 			// SCALOG (ORDER=1) uses the same batch-metadata + MessageHeader wire stream as ORDER=2/5.
 			if ((order_level_ == 5 || order_level_ == 2 || order_level_ == 1) &&
-			    should_rewrite_batch_headers) {
+			    should_rewrite_batch_headers && !feed_ordered_consume_stream) {
 				ProcessSequencer5Data(static_cast<uint8_t*>(write_ptr), bytes_received, conn_buffers);
 			}
 
@@ -2703,6 +2760,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 					pos += sizeof(Embarcadero::wire::BatchMetadata);
 					continue;
 				}
+                ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
 				pos += 8;
 				continue;
 			}
@@ -2717,6 +2775,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				const size_t payload_size = hdr->size;
 				if (payload_size == 0 ||
 				    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+                    ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
 					pos += 8;
 					continue;
 				}
@@ -2781,6 +2840,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
 				(padded_size % 64 != 0);
 			if (invalid_v1_header) {
+                ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
 				pos += 8;
 				continue;
 			}
@@ -2897,6 +2957,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			if (state.buffer.size() > kMaxStreamBufferBytes) {
 				LOG(WARNING) << "ConsumeOrdered: stream carry buffer exceeded cap, dropping "
 				             << state.buffer.size() << " bytes";
+                ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
 				reset_stream_state();
 				return;
 			}
@@ -2925,6 +2986,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			if (carry_bytes > kMaxStreamBufferBytes) {
 				LOG(WARNING) << "ConsumeOrdered: stream carry exceeded cap, dropping "
 				             << carry_bytes << " bytes";
+                ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
 				reset_stream_state();
 				return;
 			}
@@ -2972,6 +3034,7 @@ void Subscriber::StageOrderedMessages(
 	bool ready_to_consume = false;
 	{
 		absl::MutexLock lock(&consume_mutex_);
+        ordered_received_messages_ += messages.size();
 
 		// [[EXPORT_GAP_REANCHOR]] The broker's export cursor for this connection lapped
 		// its ring and already overwrote the positions it skipped -- they will never be
@@ -3010,6 +3073,7 @@ void Subscriber::StageOrderedMessages(
 
 		for (auto& [total_order, msg] : messages) {
 			if (!msg || total_order < next_expected_order_) {
+                if (msg) ++ordered_duplicate_messages_;
 				continue;
 			}
 			if (pending_messages_.empty()) {
@@ -3035,6 +3099,7 @@ void Subscriber::StageOrderedMessages(
 				pending_messages_.resize(index + 1);
 			}
 			if (pending_messages_[index]) {
+                ++ordered_duplicate_messages_;
 				VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
 				        << " (keeping first)";
 				continue;

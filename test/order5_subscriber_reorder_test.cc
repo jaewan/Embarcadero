@@ -128,6 +128,10 @@ struct SubscriberTestPeer {
 		sub.next_expected_order_ = 0;
 		sub.pending_messages_base_order_ = 0;
 		sub.pending_messages_.clear();
+        sub.ordered_received_messages_ = 0;
+        sub.ordered_duplicate_messages_ = 0;
+        sub.ordered_parse_errors_.store(0);
+        sub.ordered_export_gaps_reported_.store(0);
 	}
 };
 
@@ -404,4 +408,89 @@ TEST(Order5SubscriberReorder, ExportGapReanchorPreservesAlreadyBufferedFutureDat
 	EXPECT_EQ(delivered, expected)
 		<< "connection C's already-buffered future data must survive the re-anchor, "
 		<< "not be discarded alongside the genuinely-lost pre-gap prefix";
+}
+
+namespace {
+std::vector<uint8_t> AuditFrames(uint32_t count) {
+    Embarcadero::wire::BatchMetadata meta{};
+    meta.header_version = Embarcadero::wire::HEADER_VERSION_V2;
+    meta.num_messages = count;
+    constexpr size_t payload = 32;
+    const size_t stride = Embarcadero::wire::ComputeStrideV2(payload);
+    std::vector<uint8_t> bytes(sizeof(meta) + count * stride, 0);
+    std::memcpy(bytes.data(), &meta, sizeof(meta));
+    for (uint32_t i = 0; i < count; ++i) {
+        Embarcadero::BlogMessageHeader header{};
+        header.size = payload;
+        auto* frame = bytes.data() + sizeof(meta) + i * stride;
+        std::memcpy(frame, &header, sizeof(header));
+        std::memset(frame + sizeof(header), 'a', payload);
+    }
+    return bytes;
+}
+}
+
+TEST(Order5DeliveryAudit, ValidatesFragmentedProductionConsumerAndPayload) {
+    auto& sub = SharedSubscriber();
+    SubscriberTestPeer::ResetOrderState(sub);
+    SubscriberTestPeer::StreamParseState state;
+    const auto bytes = AuditFrames(4);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        SubscriberTestPeer::ParseChunk(sub, state, bytes.data() + i, 1);
+    const std::string payload(32, 'a');
+    EXPECT_TRUE(sub.AuditOrderedDelivery(4, payload.data(), payload.size(), 100));
+}
+
+TEST(Order5DeliveryAudit, RejectsMissingMessageAndCorruptedPayload) {
+    auto& sub = SharedSubscriber();
+    const std::string payload(32, 'a');
+    for (bool corruption : {false, true}) {
+        SubscriberTestPeer::ResetOrderState(sub);
+        SubscriberTestPeer::StreamParseState state;
+        auto bytes = AuditFrames(1);
+        if (corruption) bytes[sizeof(Embarcadero::wire::BatchMetadata) + kHeaderSize] = 'b';
+        SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), bytes.size());
+        EXPECT_FALSE(sub.AuditOrderedDelivery(corruption ? 1 : 2, payload.data(), payload.size(), 30));
+    }
+}
+
+TEST(Order5DeliveryAudit, RejectsDuplicateEvenWhenReorderBufferSuppressesIt) {
+    auto& sub = SharedSubscriber();
+    SubscriberTestPeer::ResetOrderState(sub);
+    SubscriberTestPeer::StreamParseState state;
+    const auto bytes = AuditFrames(1);
+    SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), bytes.size());
+    SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), bytes.size());
+    const std::string payload(32, 'a');
+    EXPECT_FALSE(sub.AuditOrderedDelivery(1, payload.data(), payload.size(), 100));
+}
+
+TEST(Order5DeliveryAudit, RejectsMalformedPrefixEvenWhenParserResynchronizes) {
+    auto& sub = SharedSubscriber();
+    SubscriberTestPeer::ResetOrderState(sub);
+    SubscriberTestPeer::StreamParseState state;
+    auto bytes = AuditFrames(1);
+    bytes.insert(bytes.begin(), 8, 0xff);
+    SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), bytes.size());
+    const std::string payload(32, 'a');
+    EXPECT_FALSE(sub.AuditOrderedDelivery(1, payload.data(), payload.size(), 100));
+}
+
+TEST(Order5DeliveryAudit, IndexedPayloadDetectsReorderedIdenticalMessageBodies) {
+    auto& sub = SharedSubscriber();
+    const std::string payload(32, 'a');
+    for (int variant = 0; variant < 3; ++variant) {
+        SubscriberTestPeer::ResetOrderState(sub);
+        SubscriberTestPeer::StreamParseState state;
+        auto bytes = AuditFrames(2);
+        const auto stride = Embarcadero::wire::ComputeStrideV2(payload.size());
+        // Rest of both payloads is identical; only true message identity catches this.
+        for (size_t i = 0; i < 2; ++i) {
+            const uint64_t index = variant == 0 ? i : variant == 1 ? 1 - i : 0;
+            std::memcpy(bytes.data() + sizeof(Embarcadero::wire::BatchMetadata) +
+                        i * stride + kHeaderSize, &index, sizeof(index));
+        }
+        SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), bytes.size());
+        EXPECT_EQ(sub.AuditOrderedDelivery(2, payload.data(), payload.size(), 100, true), variant == 0);
+    }
 }

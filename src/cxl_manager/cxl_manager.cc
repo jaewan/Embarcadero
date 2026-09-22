@@ -1,4 +1,6 @@
+#include "common/topic_identity.h"
 #include "cxl_manager.h"
+#include "cxl_manager/shared_mapping.h"
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
@@ -48,34 +50,15 @@ static std::string GetCxlShmName() {
 	return "/CXL_SHARED_FILE_" + std::to_string(static_cast<unsigned long>(getuid()));
 }
 
-static std::string GetCxlFallbackFilePath(const std::string& shm_name) {
-	std::string sanitized = shm_name;
-	for (char& c : sanitized) {
-		if (c == '/') {
-			c = '_';
-		}
-	}
-	return "/tmp/embarcadero_cxl" + sanitized;
-}
-
-static int OpenCxlBackingFd(const std::string& shm_name) {
-	int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
+static int OpenCxlBackingFd(const std::string& shm_name, bool create) {
+	int fd = shm_open(shm_name.c_str(), (create ? O_CREAT : 0) | O_RDWR, 0600);
 	if (fd >= 0) {
 		return fd;
 	}
 
 	const int shm_errno = errno;
-	LOG(WARNING) << "shm_open failed for " << shm_name << ": " << strerror(shm_errno);
-
-	if (shm_errno == EACCES || shm_errno == EPERM) {
-		const std::string fallback_path = GetCxlFallbackFilePath(shm_name);
-		fd = open(fallback_path.c_str(), O_CREAT | O_RDWR, 0666);
-		if (fd >= 0) {
-			LOG(WARNING) << "Using file-backed CXL region at " << fallback_path;
-			return fd;
-		}
-		LOG(ERROR) << "Fallback file open also failed: " << strerror(errno);
-	}
+	LOG(ERROR) << "shm_open failed for " << shm_name << ": " << strerror(shm_errno)
+               << "; choose a fresh region owned by this user. The memory backend cannot fall back to a /tmp file.";
 
 	errno = shm_errno;
 	return -1;
@@ -151,12 +134,25 @@ static inline void* allocate_shm(
 					LOG(ERROR) << "Cannot allocate from real CXL and NUMA is unavailable";
 					return nullptr;
 				}
-				cxl_fd = OpenCxlBackingFd(shm_name);
+                const int node = Configuration::getInstance().config().cxl.numa_node.get();
+                if (node < 0 || node > numa_max_node() || !numa_bitmask_isbitset(numa_all_nodes_ptr, node)) {
+                    LOG(ERROR) << "Requested CXL NUMA node " << node << " is absent; select --emul explicitly for DRAM";
+                    return nullptr;
+                }
+                auto* cpus = numa_allocate_cpumask();
+                const bool memory_only = cpus && numa_node_to_cpus(node, cpus) == 0 &&
+                    numa_bitmask_weight(cpus) == 0;
+                if (cpus) numa_free_cpumask(cpus);
+                if (!memory_only) {
+                    LOG(ERROR) << "Real NUMA fallback requires a memory-only CXL node; use --emul for CPU-node DRAM";
+                    return nullptr;
+                }
+                cxl_fd = OpenCxlBackingFd(shm_name, broker_id == 0);
 			}else{
 				// Keep /dev/dax path as-is.
 			}
 	}else{
-		cxl_fd = OpenCxlBackingFd(shm_name);
+		cxl_fd = OpenCxlBackingFd(shm_name, broker_id == 0);
 	}
 
 	if (cxl_fd < 0){
@@ -173,6 +169,14 @@ static inline void* allocate_shm(
 		}
 		LOG(INFO) << "ftruncate completed successfully";
 	}
+    if (!dev) {
+        struct stat st{};
+        if (fstat(cxl_fd, &st) != 0 || st.st_size < 0 || static_cast<size_t>(st.st_size) != cxl_size) {
+            LOG(ERROR) << "Shared region size mismatch before mmap";
+            close(cxl_fd);
+            return nullptr;
+        }
+    }
 	// For real CXL on head broker, keep mapping lazy and bind before first-touch.
 	const bool will_mbind = (cxl_type == Real && !dev && broker_id == 0);
 	const bool use_map_populate = !will_mbind && ShouldPopulateCxlMapping();
@@ -180,60 +184,34 @@ static inline void* allocate_shm(
 	          << (will_mbind ? " (lazy populate after mbind to CXL node)"
 	                         : (use_map_populate ? " (MAP_POPULATE)" : " (lazy populate)"));
 
-	const char* fixed_addr_env = std::getenv("EMBARCADERO_CXL_BASE_ADDR");
-	std::vector<uintptr_t> fixed_addrs;
-	if (fixed_addr_env && fixed_addr_env[0] != '\0') {
-		char* end = nullptr;
-		uintptr_t parsed = static_cast<uintptr_t>(std::strtoull(fixed_addr_env, &end, 0));
-		if (end && *end == '\0' && parsed != 0) {
-			fixed_addrs.push_back(parsed);
-		} else {
-			LOG(ERROR) << "Invalid EMBARCADERO_CXL_BASE_ADDR: " << fixed_addr_env;
-			close(cxl_fd);
-			return nullptr;
-		}
-	} else {
-		// Fallback addresses to keep all brokers on the same virtual base.
-		fixed_addrs = {
-			0x600000000000ULL,
-			0x500000000000ULL,
-			0x400000000000ULL
-		};
-	}
-
-	for (uintptr_t candidate : fixed_addrs) {
-#ifdef MAP_FIXED_NOREPLACE
-		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
-		            PROT_READ | PROT_WRITE,
-		            MAP_SHARED | (use_map_populate ? static_cast<int>(MAP_POPULATE) : 0) | MAP_FIXED_NOREPLACE,
-		            cxl_fd, 0);
-#else
-		// Best-effort fallback if MAP_FIXED_NOREPLACE is unavailable.
-		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
-		            PROT_READ | PROT_WRITE,
-		            MAP_SHARED | (use_map_populate ? MAP_POPULATE : 0) | MAP_FIXED,
-		            cxl_fd, 0);
-#endif
-		if (addr != MAP_FAILED) {
-			if (addr != reinterpret_cast<void*>(candidate)) {
-				LOG(ERROR) << "CXL mapping did not honor requested address "
-				           << reinterpret_cast<void*>(candidate)
-				           << ", got " << addr;
-				munmap(addr, cxl_size);
-				addr = MAP_FAILED;
-				continue;
-			}
-			break;
-		}
-	}
-
-	if (addr == MAP_FAILED || addr == nullptr) {
-		LOG(ERROR) << "Mapping CXL failed: " << strerror(errno);
-		close(cxl_fd);
-		return nullptr;
-	}
+    try {
+        const auto explicit_base = cxl_manager::ParseMappingAddress(std::getenv("EMBARCADERO_CXL_BASE_ADDR"));
+        std::vector<uintptr_t> candidates;
+        if (broker_id == 0) {
+            candidates = explicit_base ? std::vector<uintptr_t>{*explicit_base} :
+                std::vector<uintptr_t>{0x600000000000ULL, 0x500000000000ULL, 0x400000000000ULL};
+        } else {
+            const auto layout = cxl_manager::CalculateRegionLayout(Configuration::getInstance().config());
+            const auto base = cxl_manager::DiscoverPublishedBase(cxl_fd, cxl_size, explicit_base,
+                [&](const cxl_manager::RegionDescriptor& descriptor) {
+                    if (!cxl_manager::RegionDescriptorMatches(descriptor, layout,
+                            NUM_MAX_BROKERS_CONFIG, MAX_TOPIC_SIZE, BATCHHEADERS_SIZE,
+                            static_cast<uint64_t>(cxl_type), descriptor.mapping_base))
+                        throw std::runtime_error("shared-region descriptor geometry/backend/version mismatch before attachment; use identical broker configuration and a fresh region for a new layout");
+                }, [](const cxl_manager::RegionDescriptor* descriptor) {
+                    CXL::invalidate_cacheline_for_read(descriptor);
+                    CXL::load_fence();
+                });
+            candidates = {base};
+        }
+        addr = cxl_manager::SelectAndMapShared(cxl_fd, cxl_size, use_map_populate, candidates);
+    } catch (...) {
+        close(cxl_fd);
+        throw;
+    }
 	close(cxl_fd);
 	LOG(INFO) << "CXL mapping successful at address: " << addr;
+    cxl_manager::SharedMapping mapping_owner(addr, cxl_size);
 	if (dax_backed) {
 		*dax_backed = dev;
 	}
@@ -254,6 +232,8 @@ static inline void* allocate_shm(
 			LOG(WARNING) << "mbind to NUMA node " << cxl_numa_node
 			             << " failed: " << strerror(errno)
 			             << ". Ensure runner uses numactl --membind including CXL node.";
+            numa_free_nodemask(bitmask);
+            return nullptr;
 		} else {
 			LOG(INFO) << "CXL region bound to NUMA node " << cxl_numa_node
 			          << " (" << cxl_size << " bytes)";
@@ -261,27 +241,20 @@ static inline void* allocate_shm(
 		numa_free_nodemask(bitmask);
 	}
 
-	if(broker_id == 0){
-		if (SkipCxlZeroingEnabled()) {
+    if (broker_id == 0) {
+        auto* descriptor = reinterpret_cast<cxl_manager::RegionDescriptor*>(
+            static_cast<uint8_t*>(addr) + cxl_manager::kRegionDescriptorOffset);
+        descriptor->ready.store(0, std::memory_order_release);
+        CXL::flush_cacheline(descriptor);
+        CXL::store_fence();
+        if (SkipCxlZeroingEnabled()) {
 			LOG(INFO) << "Head broker skipping CXL zero "
 			          << "(EMBARCADERO_CXL_ZERO_MODE=none|skip|off)";
 		} else {
 		size_t clear_bytes = cxl_size;
 		bool metadata_only = MetadataOnlyZeroingEnabled();
 		if (metadata_only) {
-			size_t cacheline_size = static_cast<size_t>(sysconf(_SC_LEVEL1_DCACHE_LINESIZE));
-			size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
-			size_t padding = TINode_Region_size % cacheline_size;
-			if (padding != 0) {
-				TINode_Region_size += (cacheline_size - padding);
-			}
-			size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-			size_t BatchHeaders_Region_size = NUM_MAX_BROKERS_CONFIG * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-			size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
-			const size_t layout_base = BaseRegionsOffset(NUM_MAX_BROKERS_CONFIG);
-			size_t metadata_bytes = layout_base + TINode_Region_size + Bitmap_Region_size +
-				BatchHeaders_Region_size + SessionTable_Region_size;
-			clear_bytes = std::min(cxl_size, metadata_bytes);
+            clear_bytes = cxl_manager::CalculateRegionLayout(Configuration::getInstance().config()).metadata_bytes;
 			LOG(INFO) << "Head broker clearing CXL metadata only: " << clear_bytes
 			          << " bytes (set EMBARCADERO_CXL_ZERO_MODE=full to clear full region)";
 		} else {
@@ -334,7 +307,7 @@ static inline void* allocate_shm(
 		          << clear_ms << " ms";
 		}  // !SkipCxlZeroingEnabled
 	}
-	return addr;
+	return mapping_owner.release();
 }
 
 CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
@@ -344,16 +317,20 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 
 	// CRITICAL FIX: All brokers must use the same CXL size for consistent memory layout
 	// Get the configured size from YAML to ensure consistency
-	cxl_size_ = Embarcadero::Configuration::getInstance().config().cxl.size.get();
+	layout_ = cxl_manager::CalculateRegionLayout(Configuration::getInstance().config());
+    cxl_size_ = layout_.region_bytes;
+    if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS_CONFIG)
+        throw std::invalid_argument("broker id exceeds region broker capacity");
+    if (broker_id == 0 && SkipCxlZeroingEnabled())
+        throw std::invalid_argument("uninitialized/reused region mode is unsupported; use full or metadata initialization");
 	
 	LOG(INFO) << "CXLManager: broker_id=" << broker_id << " using CXL size=" << cxl_size_ << " bytes";
 
 	// Initialize CXL
 	bool dax_backed = false;
 	cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_, &dax_backed);
-	if(cxl_addr_ == nullptr){
-		return;
-	}
+	if (cxl_addr_ == nullptr) throw std::runtime_error("shared region mapping failed; see preceding backend/size/NUMA diagnostic");
+    cxl_manager::SharedMapping initialization_mapping(cxl_addr_, cxl_size_);
 	const bool coherent_opt_in = CxlCoherentOptInEnabled();
 	requires_explicit_payload_header_flush_ = (cxl_type == Real) && !coherent_opt_in;
 	CXL::SetExplicitFlushRequired(requires_explicit_payload_header_flush_);
@@ -364,6 +341,25 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	          << " dax_backed=" << (dax_backed ? 1 : 0)
 	          << " EMBARCADERO_CXL_COHERENT="
 	          << (std::getenv("EMBARCADERO_CXL_COHERENT") ? std::getenv("EMBARCADERO_CXL_COHERENT") : "<unset>");
+
+    auto* descriptor = reinterpret_cast<cxl_manager::RegionDescriptor*>(
+        static_cast<uint8_t*>(cxl_addr_) + cxl_manager::kRegionDescriptorOffset);
+    if (broker_id_ != 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (true) {
+            CXL::invalidate_cacheline_for_read(descriptor);
+            CXL::load_fence();
+            if (descriptor->ready.load(std::memory_order_acquire) == cxl_manager::kRegionReady) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("shared region initialization timed out or layout is obsolete");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!cxl_manager::RegionDescriptorMatches(*descriptor, layout_, NUM_MAX_BROKERS_CONFIG,
+                MAX_TOPIC_SIZE, BATCHHEADERS_SIZE, static_cast<uint64_t>(cxl_type), reinterpret_cast<uintptr_t>(cxl_addr_))) {
+            throw std::runtime_error("shared region geometry/backend/version mismatch");
+        }
+    }
 
 		// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes).
 		// Layout v3: ControlBlock | CompletionVector | GOI | fixed mailbox | topic metadata.
@@ -377,36 +373,12 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		uint8_t* base_for_regions = reinterpret_cast<uint8_t*>(base_for_regions_);
 
 		// Initialize CXL memory regions (TInode, Bitmap, BatchHeaders, Segments after Phase 2 region)
-		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
-		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
-		TINode_Region_size += padding;
-		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-		// Use configured max brokers consistently with GetNewSegment()
-		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
-		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
-		
-		// [[DEVIATION_005: Atomic Bitmap-Based Segment Allocation]]
-		// Phase 1: Single-Node Optimized (cache-coherent)
-		// All brokers share the same segment pool (no per-broker partitioning)
-		// This prevents fragmentation and enables efficient multi-topic support
-		// See docs/memory-bank/spec_deviation.md DEV-005
-		
-		// Calculate total segment region size (shared pool for all brokers)
-		// Usable size = after Phase 2 metadata (ControlBlock + CV + GOI)
-		const size_t layout_base = BaseRegionsOffset(configured_max_brokers);
-		if (cxl_size_ < layout_base + TINode_Region_size + Bitmap_Region_size +
-				BatchHeaders_Region_size + SessionTable_Region_size) {
-			LOG(ERROR) << "CXL size " << cxl_size_ << " too small for layout v2: need at least "
-			           << (layout_base + TINode_Region_size + Bitmap_Region_size +
-			               BatchHeaders_Region_size + SessionTable_Region_size)
-			           << " (GOI + fixed mailbox + TInode + Bitmap + BatchHeaders + SessionTable)";
-			return;
-		}
-		size_t Segment_Region_size = (cxl_size_ - layout_base - TINode_Region_size -
-			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
-		padding = Segment_Region_size % cacheline_size;
-		Segment_Region_size -= padding;
+        const size_t TINode_Region_size = layout_.tinode_bytes;
+        const size_t Bitmap_Region_size = layout_.bitmap_bytes;
+        const size_t BatchHeaders_Region_size = layout_.batch_headers_bytes;
+        const size_t SessionTable_Region_size = layout_.session_table_bytes;
+        const size_t Segment_Region_size = layout_.payload_bytes;
+
 		// Benchmark launchers know how many independent broker logs must fit in
 		// this shared CXL extent.  Refuse an impossible geometry before accepting
 		// clients: otherwise topic discovery repeatedly retries allocation and can
@@ -637,8 +609,26 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		}
 
 		VLOG(3) << "\t[CXLManager]: \t\tConstructed";
-		return;
-	}
+	    if (broker_id_ == 0) {
+        descriptor->ready.store(0, std::memory_order_relaxed);
+        descriptor->version = cxl_manager::kCxlLayoutVersion;
+        descriptor->region_bytes = layout_.region_bytes;
+        descriptor->metadata_bytes = layout_.metadata_bytes;
+        descriptor->segment_size = layout_.segment_size;
+        descriptor->pbr_bytes = BATCHHEADERS_SIZE;
+        descriptor->brokers = NUM_MAX_BROKERS_CONFIG;
+        descriptor->topics = MAX_TOPIC_SIZE;
+        descriptor->backend = static_cast<uint32_t>(cxl_type);
+        descriptor->mapping_base = reinterpret_cast<uintptr_t>(cxl_addr_);
+        CXL::store_fence();
+        CXL::flush_cacheline(descriptor);
+        CXL::store_fence();
+        descriptor->ready.store(cxl_manager::kRegionReady, std::memory_order_release);
+        CXL::flush_cacheline(descriptor);
+        CXL::store_fence();
+    }
+    initialization_mapping.release();
+}
 
 CXLManager::~CXLManager(){
 	stop_threads_ = true;
@@ -712,13 +702,8 @@ bool CXLManager::ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_he
 			segment_header, logical_offset, batch_header_location, epoch_already_checked);
 }
 
-inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {
-	unsigned int hash = 0;
-
-	for (int i = 0; i < TOPIC_NAME_SIZE; ++i) {
-		hash = (hash * TOPIC_NAME_SIZE) + topic[i];
-	}
-	return hash % MAX_TOPIC_SIZE;
+inline size_t hashTopic(const char* topic) {
+    return TopicSlot(topic, MAX_TOPIC_SIZE, TOPIC_NAME_SIZE);
 }
 
 // This function returns TInode without inspecting if the topic exists
@@ -731,10 +716,10 @@ TInode* CXLManager::GetTInode(const char* topic){
 }
 
 TInode* CXLManager::GetReplicaTInode(const char* topic){
-	char replica_topic[TOPIC_NAME_SIZE];
-	memcpy(replica_topic, topic, TOPIC_NAME_SIZE);
-	memcpy((uint8_t*)replica_topic + (TOPIC_NAME_SIZE-7), "replica", 7); 
-	int TInode_idx = hashTopic(replica_topic);
+    const size_t primary = hashTopic(topic);
+    // Single supported topic: reserve a distinct metadata slot for its replica.
+    if (MAX_TOPIC_SIZE < 2) return nullptr;
+    const size_t TInode_idx = (primary + 1) % MAX_TOPIC_SIZE;
 	return (TInode*)((uint8_t*)base_for_regions_ + (TInode_idx * sizeof(struct TInode)));
 }
 
@@ -781,124 +766,27 @@ void* CXLManager::GetNewSegment(){
 	// Use per-broker segment allocation instead of global atomic counter
     // This eliminates cross-process contention and provides proper isolation
 	
-	// Calculate total segments in shared pool (static initialization)
-	static size_t total_segments = 0;
-	static size_t bitmap_words = 0;
-	static bool initialized = false;
-	
-	if (!initialized) {
-		size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
-		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
-		TINode_Region_size += padding;
-		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-		
-		// Get configuration values
-		size_t cxl_size = Embarcadero::Configuration::getInstance().config().cxl.size.get();
-		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
-		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
-		
-		// [[DEVIATION_004]] - Bmeta region removed; regions start after Phase 2 metadata.
-		const size_t layout_base = BaseRegionsOffset(NUM_MAX_BROKERS_CONFIG);
-		size_t Segment_Region_size = (cxl_size - layout_base - TINode_Region_size -
-			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
-		padding = Segment_Region_size % cacheline_size;
-		Segment_Region_size -= padding;
-		
-		total_segments = Segment_Region_size / SEGMENT_SIZE;
-		bitmap_words = (total_segments + 63) / 64;  // Round up to uint64_t words
-		
-		LOG(INFO) << "GetNewSegment (Broker " << broker_id_ << "): CXL_size=" << cxl_size
-		          << " CONFIGURED_MAX_BROKERS=" << configured_max_brokers
-		          << " Segment_Region_size=" << Segment_Region_size / (1024*1024*1024) << " GB"
-		          << " SEGMENT_SIZE=" << SEGMENT_SIZE / (1024*1024) << " MB"
-		          << " total_segments=" << total_segments
-		          << " bitmap_words=" << bitmap_words;
-		initialized = true;
-	}
-	
+    const size_t total_segments = layout_.segment_count;
+
 	// Thread-local hint to reduce contention (brokers naturally drift to different bitmap words)
 	static thread_local size_t hint = 0;
 	
 	// Cast bitmap to uint64_t* for atomic operations (64 segments per word)
 	uint64_t* bitmap64 = static_cast<uint64_t*>(bitmap_);
 	
-	// Linear scan with hint: Start from last successful allocation
-	for (size_t attempts = 0; attempts < bitmap_words; ++attempts) {
-		size_t i = (hint + attempts) % bitmap_words;
-		
-		// Load current bitmap word (acquire semantics for visibility)
-		uint64_t current_bits = __atomic_load_n(&bitmap64[i], __ATOMIC_ACQUIRE);
-		
-		// Skip if word is full (all 64 segments allocated)
-		if (current_bits == 0xFFFFFFFFFFFFFFFFULL) {
-			continue;
-		}
-		
-		// [[PERFORMANCE: OPTIMIZED]] Use bit manipulation to find first zero bit faster
-		// Instead of scanning all 64 bits, use __builtin_ctzll to find first zero
-		// This reduces average scan time from O(32) to O(1) for sparse bitmaps
-		uint64_t inverted = ~current_bits;  // Invert: 1 = free, 0 = allocated
-		
-		if (inverted == 0) {
-			// All bits set (all segments allocated in this word)
-			continue;
-		}
-		
-		// Find first zero bit (first free segment) using hardware instruction
-		// __builtin_ctzll returns number of trailing zeros (0-63)
-		// If inverted has no set bits, behavior is undefined, but we checked above
-		int bit = __builtin_ctzll(inverted);  // Count trailing zeros = first set bit in inverted
-		
-		// bit is guaranteed to be 0-63 by __builtin_ctzll semantics
-		uint64_t mask = 1ULL << bit;
-		
-		// Attempt atomic claim: set bit to 1
-		uint64_t old = __atomic_fetch_or(&bitmap64[i], mask, __ATOMIC_SEQ_CST);
-		
-		// Verify we successfully claimed it (bit was 0 before)
-		if (!(old & mask)) {
-			// Success! Calculate global segment index and address
-			size_t global_idx = (i * 64) + bit;
-			
-			// Bounds check
-			if (global_idx >= total_segments) {
-				// This shouldn't happen, but handle gracefully
-				LOG(ERROR) << "Broker " << broker_id_ 
-				           << " allocated out-of-bounds segment " << global_idx
-				           << " (max: " << total_segments << ")";
-				// Unset the bit we just set
-				__atomic_fetch_and(&bitmap64[i], ~mask, __ATOMIC_SEQ_CST);
-				continue;
-			}
-			
-			void* segment_addr = static_cast<uint8_t*>(segments_) + (global_idx * SEGMENT_SIZE);
-			
-			// Update hint for next allocation (reduces contention)
-			hint = i;
-			
-			// CRITICAL: Flush bitmap cache line for CXL visibility
-			// Even on cache-coherent systems, this ensures visibility to CXL device
-			CXL::store_fence();
-			CXL::flush_cacheline(&bitmap64[i]);
-			CXL::store_fence();
-			
-			// Initialize segment header (first 64 bytes)
-			memset(segment_addr, 0, 64);
-			CXL::store_fence();
-			CXL::flush_cacheline(segment_addr);
-			CXL::store_fence();
-			
-			LOG(INFO) << "Broker " << broker_id_ 
-			          << " allocated segment " << global_idx 
-			          << " at " << segment_addr;
-			
-			return segment_addr;
-		}
-		// If atomic claim failed (another broker claimed it), continue to next word
-	}
-	
+    if (const auto claimed = cxl_manager::ClaimSegment(bitmap64, total_segments, hint)) {
+        const size_t global_idx = *claimed;
+        void* segment_addr = static_cast<uint8_t*>(segments_) + global_idx * layout_.segment_size;
+        CXL::store_fence();
+        CXL::flush_cacheline(&bitmap64[global_idx / 64]);
+        CXL::store_fence();
+        memset(segment_addr, 0, 64);
+        CXL::flush_cacheline(segment_addr);
+        CXL::store_fence();
+        LOG(INFO) << "Broker " << broker_id_ << " allocated segment " << global_idx << " at " << segment_addr;
+        return segment_addr;
+    }
+
 	// All segments exhausted
 	LOG(ERROR) << "CXL memory exhausted: All " << total_segments 
 	           << " segments allocated (Broker " << broker_id_ << ")";
@@ -916,24 +804,7 @@ bool CXLManager::FreeSegment(void* segment_addr) {
 		return false;
 	}
 	const size_t global_idx = (addr - base) / SEGMENT_SIZE;
-	size_t total_segments = 0;
-	{
-		size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
-		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
-		TINode_Region_size += padding;
-		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-		size_t cxl_size = Embarcadero::Configuration::getInstance().config().cxl.size.get();
-		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
-		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
-		const size_t layout_base = BaseRegionsOffset(configured_max_brokers);
-		size_t Segment_Region_size = (cxl_size - layout_base - TINode_Region_size -
-			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
-		padding = Segment_Region_size % cacheline_size;
-		Segment_Region_size -= padding;
-		total_segments = Segment_Region_size / SEGMENT_SIZE;
-	}
+    const size_t total_segments = layout_.segment_count;
 	if (global_idx >= total_segments) {
 		LOG(ERROR) << "FreeSegment: out of range index " << global_idx;
 		return false;
@@ -954,9 +825,8 @@ bool CXLManager::FreeSegment(void* segment_addr) {
 }
 
 void* CXLManager::GetNewBatchHeaderLog(){
-	static std::atomic<size_t> batch_header_log_count{0};
-	CHECK_LT(batch_header_log_count, MAX_TOPIC_SIZE) << "You are creating too many topics";
-	size_t offset = batch_header_log_count.fetch_add(1, std::memory_order_relaxed);
+    const size_t offset = batch_header_log_count_.fetch_add(1, std::memory_order_relaxed);
+    if (offset >= static_cast<size_t>(MAX_TOPIC_SIZE)) return nullptr;
 
 	return (uint8_t*)batchHeaders_  + offset*BATCHHEADERS_SIZE;
 }

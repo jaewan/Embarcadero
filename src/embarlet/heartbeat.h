@@ -63,6 +63,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
 		HeartBeatServiceImpl(std::string head_addr);
 		~HeartBeatServiceImpl();
+        void RequestShutdown();
 
 		Status RegisterNode(ServerContext* context, const NodeInfo* request,
 				RegistrationStatus* reply) override;
@@ -93,6 +94,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				struct Embarcadero::TInode *tinode);
 		std::string GetNextBrokerAddr(int broker_id);
 		int GetNumBrokers();
+        std::vector<int> GetLiveBrokerIds();
 
 	private:
 		// Renamed to avoid conflict with proto's NodeInfo
@@ -116,9 +118,12 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		absl::Mutex subscriber_mutex_;
 		std::thread heartbeat_thread_;
 		std::atomic<bool> shutdown_{false};
+        std::mutex heartbeat_wait_mutex_;
+        std::condition_variable heartbeat_wait_cv_;
+        int next_broker_id_{1};  // No identity reuse within a shared-region lifetime.
 		std::shared_ptr<Server> server_;
 		absl::Mutex cluster_mutex_;
-		uint64_t cluster_version_{0} ABSL_GUARDED_BY(cluster_mutex_);  // Incremented when cluster changes
+		std::atomic<uint64_t> cluster_version_{0};  // Read by heartbeat and membership RPCs
 		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
 };
 
@@ -131,6 +136,7 @@ class FollowerNodeClient {
 		void Wait();
 		void RequestShutdown();
 		int GetNumBrokers();
+        std::vector<int> GetLiveBrokerIds();
 		bool IsHeadAlive() const { return head_alive_; }
 		void SetHeadAlive(bool alive) { head_alive_ = alive; }
 		void SetAcceptsPublishes(bool accepts);
@@ -198,6 +204,7 @@ class HeartBeatManager {
 				struct Embarcadero::TInode *tinode);
 		std::string GetNextBrokerAddr(int broker_id);
 		int GetNumBrokers();
+        std::vector<int> GetLiveBrokerIds();
 		void SetAcceptsPublishes(bool accepts);
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback);
 

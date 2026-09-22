@@ -3,8 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BUILD_DIR="$PROJECT_ROOT/build"
+BUILD_DIR="${EMBARCADERO_TEST_BUILD_DIR:-$PROJECT_ROOT/build}"
 BIN_DIR="$BUILD_DIR/bin"
+BROKER_BIN="${EMBARCADERO_TEST_BROKER:-$BIN_DIR/embarlet}"
+CLIENT_BIN="${EMBARCADERO_TEST_CLIENT:-$BIN_DIR/throughput_test}"
 CONFIG_DIR="$PROJECT_ROOT/config"
 OUT_DIR="$BUILD_DIR/test_output/order5_multibroker_unacked_release"
 LOCK_FILE="${EMBARCADERO_TESTBED_LOCK:-$(cd "$PROJECT_ROOT/.." && pwd)/testbed.lock}"
@@ -68,8 +70,8 @@ run_test_body() {
 	cd "$OUT_DIR"
 	rm -f ./*.log /tmp/embarlet_*_ready 2>/dev/null || true
 
-	[ -x "$BIN_DIR/embarlet" ] || fail "missing $BIN_DIR/embarlet"
-	[ -x "$BIN_DIR/throughput_test" ] || fail "missing $BIN_DIR/throughput_test"
+	[ -x "$BROKER_BIN" ] || fail "missing $BIN_DIR/embarlet"
+	[ -x "$CLIENT_BIN" ] || fail "missing $BIN_DIR/throughput_test"
 
 	env \
 		NUM_BROKERS="$NUM_BROKERS" \
@@ -79,7 +81,7 @@ run_test_body() {
 		EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk0,$OUT_DIR/disk1" \
 		EMBAR_ASSERT_COMMIT_ORDER=1 \
 		EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \
-		"$BIN_DIR/embarlet" --config "$CONFIG_DIR/embarcadero.yaml" --head --EMBARCADERO \
+		"$BROKER_BIN" --config "$CONFIG_DIR/embarcadero.yaml" --head --EMBARCADERO \
 		> broker_0.log 2>&1 &
 	pids+=("$!")
 	sleep 1
@@ -92,7 +94,7 @@ run_test_body() {
 			EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk0,$OUT_DIR/disk1" \
 			EMBAR_ASSERT_COMMIT_ORDER=1 \
 			EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \
-			"$BIN_DIR/embarlet" --config "$CONFIG_DIR/embarcadero.yaml" --EMBARCADERO \
+			"$BROKER_BIN" --config "$CONFIG_DIR/embarcadero.yaml" --EMBARCADERO \
 			> "broker_${b}.log" 2>&1 &
 		pids+=("$!")
 		sleep 0.35
@@ -106,7 +108,7 @@ run_test_body() {
 		EMBAR_USE_HUGETLB=0 \
 		EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk0,$OUT_DIR/disk1" \
 		EMBAR_ASSERT_COMMIT_ORDER=1 \
-		"$BIN_DIR/throughput_test" \
+		"$CLIENT_BIN" \
 			--config "$CONFIG_DIR/client.yaml" \
 			-n 1 -m "$MESSAGE_SIZE" -s "$TOTAL_BYTES" -t 5 -o 5 -a 1 \
 			--sequencer EMBARCADERO --head_addr 127.0.0.1 -l 0 -r 0 \

@@ -7,7 +7,8 @@
 #include <optional>
 #include <mutex>
 #include <chrono>
-#include "folly/MPMCQueue.h"
+#include "common/cancellable_queue.h"
+#include <atomic>
 #include "common/config.h"
 
 // Forward Declarations
@@ -56,13 +57,14 @@ class DiskManager{
 		}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
-		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
+		bool Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor, int admitted_brokers);
 		/**
 		 * Bind chain-replication RF to the authoritative per-topic value.
 		 * Fails closed if an already-started chain manager was configured with a
 		 * conflicting EMBARCADERO_REPLICATION_FACTOR.
 		 */
-		void EnsureTopicReplicationFactor(int topic_replication_factor);
+		bool ValidateTopicReplication(int order, int topic_replication_factor, int live_brokers,
+            heartbeat_system::SequencerType sequencer, std::string& error) const;
 		void StartScalogReplicaLocalSequencer();
 		void StartScalogCXLReplication(TInode* tinode);
 		void StartScalogCXLReplicaPolling(TInode* tinode, int primary_id, int replica_index);
@@ -81,8 +83,8 @@ class DiskManager{
 			size_t &batch_start_logical_offset, size_t &batch_last_logical_offset);
 
 		std::vector<std::thread> threads_;
-		folly::MPMCQueue<std::optional<struct ReplicationRequest>> requestQueue_;
-		folly::MPMCQueue<std::optional<MemcpyRequest>> copyQueue_;
+		CancellableQueue<std::optional<struct ReplicationRequest>> requestQueue_;
+		CancellableQueue<std::optional<MemcpyRequest>> copyQueue_;
 		int broker_id_;
 		void* cxl_addr_;
 		bool log_to_memory_;
@@ -91,10 +93,11 @@ class DiskManager{
 		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;
 		std::unique_ptr<Scalog::ScalogReplicationManager> scalog_replication_manager_;
 		std::unique_ptr<Embarcadero::ChainReplicationManager> chain_replication_manager_;
-		int chain_replication_factor_{0};  // RF used when chain manager was started (0 = none)
+		int chain_replication_brokers_{0};
+        int chain_replication_factor_{0};  // RF used when chain manager was started (0 = none)
 
 		std::atomic<int> offset_{0};
-		bool stop_threads_ = false;
+		std::atomic<bool> stop_threads_{false};
 		std::atomic<size_t> thread_count_{0};
 		std::atomic<size_t> num_io_threads_{0};
 		std::atomic<size_t> num_active_threads_{0};

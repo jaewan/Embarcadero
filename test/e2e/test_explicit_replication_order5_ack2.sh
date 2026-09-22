@@ -7,8 +7,10 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BUILD_DIR="$PROJECT_ROOT/build"
+BUILD_DIR="${EMBARCADERO_TEST_BUILD_DIR:-$PROJECT_ROOT/build}"
 BIN_DIR="$BUILD_DIR/bin"
+BROKER_BIN="${EMBARCADERO_TEST_BROKER:-$BIN_DIR/embarlet}"
+CLIENT_BIN="${EMBARCADERO_TEST_CLIENT:-$BIN_DIR/throughput_test}"
 CONFIG_DIR="$PROJECT_ROOT/config"
 TEST_OUTPUT_DIR="$BUILD_DIR/test_output"
 
@@ -172,8 +174,8 @@ setup() {
     cd "$TEST_OUTPUT_DIR/$TEST_NAME"
 
     # Check prerequisites
-    assert_file_exists "$BIN_DIR/embarlet"
-    assert_file_exists "$BIN_DIR/throughput_test"
+    assert_file_exists "$BROKER_BIN"
+    assert_file_exists "$CLIENT_BIN"
     assert_file_exists "$CONFIG_DIR/embarcadero.yaml"
     assert_file_exists "$CONFIG_DIR/client.yaml"
 
@@ -209,7 +211,7 @@ start_brokers() {
 
     # Start head broker
     log_info "Starting head broker (broker 0)..."
-    $NUMA_BIND "$BIN_DIR/embarlet" \
+    $NUMA_BIND "$BROKER_BIN" \
         --config "$CONFIG_DIR/embarcadero.yaml" \
         --head --EMBARCADERO \
         > broker_0.log 2>&1 &
@@ -234,7 +236,7 @@ start_brokers() {
     # Start follower brokers
     for ((i=1; i<NUM_BROKERS; i++)); do
         log_info "Starting broker $i..."
-        $NUMA_BIND "$BIN_DIR/embarlet" \
+        $NUMA_BIND "$BROKER_BIN" \
             --config "$CONFIG_DIR/embarcadero.yaml" \
             --EMBARCADERO \
             > "broker_$i.log" 2>&1 &
@@ -290,7 +292,7 @@ run_client_test() {
     # -r 2: replication_factor=2 (CXL primary + one durable disk replica)
     # -t 5: publish-only test (simpler, deterministic)
     # Match basic_publish.sh: same NUMA policy as brokers (client defaults to numa_bind in YAML).
-    timeout $((GLOBAL_TIMEOUT - 60)) $NUMA_BIND "$BIN_DIR/throughput_test" \
+    timeout $((GLOBAL_TIMEOUT - 60)) $NUMA_BIND "$CLIENT_BIN" \
         --config "$CONFIG_DIR/client.yaml" \
         -m "$MESSAGE_SIZE" \
         -s "$total_size" \

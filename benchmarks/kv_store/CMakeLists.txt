@@ -38,6 +38,7 @@ set(KV_LINK_LIBS
     cxxopts::cxxopts
     heartbeat_grpc_proto
     session_proto
+    lazylog_metadata_grpc_proto
     corfu_sequencer_grpc_proto
     corfu_token_proxy_grpc_proto
     corfu_replication_grpc_proto

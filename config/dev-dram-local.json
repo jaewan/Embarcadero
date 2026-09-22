@@ -1,0 +1,31 @@
+{
+  "embarcadero": {
+    "version": {"major": 1, "minor": 0},
+    "cluster": {"sequencer_broker_id": 0, "data_broker_ids": [0]},
+    "broker": {"port": 1214, "broker_port": 12140, "heartbeat_interval": 3, "max_brokers": 1, "cgroup_core": 85},
+    "cxl": {"size": 68719476736, "emulation_size": 68719476736, "device_path": "/dev/dax0.0", "numa_node": 1},
+    "storage": {"segment_size": 268435456, "batch_headers_size": 10485760, "batch_size": 2097152, "num_disks": 2, "max_topics": 32, "topic_name_size": 31, "use_new_bmeta": true},
+    "network": {"io_threads": 6, "disk_io_threads": 2, "sub_connections": 1, "zero_copy_send_limit": 2097152, "pbr_high_watermark_pct": 80, "pbr_low_watermark_pct": 50, "enable_publish_pipeline_profile": false},
+    "corfu": {"sequencer_port": 50052, "replication_port": 50053, "sequencer_ip": "127.0.0.1"},
+    "scalog": {"sequencer_port": 50051, "replication_port": 50052, "sequencer_ip": "127.0.0.1", "local_cut_interval": 100},
+    "lazylog": {"sequencer_port": 50061, "replication_port": 50062, "sequencer_ip": "127.0.0.1", "local_cut_interval": 100},
+    "platform": {"is_intel": false, "is_amd": false}
+  },
+  "client": {
+    "runtime": {
+      "mode": "throughput",
+      "ack_drain_ms_throughput": 50, "ack_drain_ms_failure": 3000, "ack_drain_ms_latency": 0,
+      "socket_send_buffer_bytes_throughput": 16777216, "socket_send_buffer_bytes_failure": 16777216, "socket_send_buffer_bytes_latency": 16777216,
+      "socket_recv_buffer_bytes_throughput": 16777216, "socket_recv_buffer_bytes_failure": 16777216, "socket_recv_buffer_bytes_latency": 16777216,
+      "tcp_user_timeout_ms_throughput": 10000, "tcp_user_timeout_ms_failure": 200, "tcp_user_timeout_ms_latency": 500,
+      "header_send_timeout_ms_throughput": 10000, "header_send_timeout_ms_failure": 500, "header_send_timeout_ms_latency": 500,
+      "session_rto_min_ms_throughput": 60000, "session_rto_min_ms_failure": 12, "session_rto_min_ms_latency": 12,
+      "ack_timeout_sec_throughput": 20, "ack_timeout_sec_failure": 20, "ack_timeout_sec_latency": 20,
+      "epoll_wait_writable_ms_throughput": 1, "epoll_wait_writable_ms_failure": 0, "epoll_wait_writable_ms_latency": 1
+    },
+    "publisher": {"threads_per_broker": 1, "buffer_size_mb": 512, "batch_size_kb": 2048},
+    "subscriber": {"connections_per_broker": 1, "buffer_size_mb": 64},
+    "network": {"connect_timeout_ms": 2000, "send_timeout_ms": 10000, "recv_timeout_ms": 10000},
+    "performance": {"use_hugepages": false, "numa_bind": true, "zero_copy": false, "enable_publisher_pipeline_profile": false}
+  }
+}

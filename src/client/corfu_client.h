@@ -1,3 +1,21 @@
+#pragma once
+#ifdef EMBARCADERO_CLIENT_NO_BASELINES
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+namespace Embarcadero { struct BatchHeader; }
+// A minimal client rejects unavailable Corfu support before creating workers.
+class CorfuSequencerClient {
+ public:
+  explicit CorfuSequencerClient(uint64_t) {
+    throw std::runtime_error("Corfu is disabled in this client build; enable EMBARCADERO_CLIENT_BASELINES");
+  }
+  uint64_t UnavailableRetries() const { return 0; }
+  uint64_t TransientRetries() const { return 0; }
+  void CancelActiveRequests() {}
+  bool GetTotalOrder(Embarcadero::BatchHeader*, const std::string&) { return false; }
+};
+#else
 #include "corfu_token_proxy.grpc.pb.h"
 #include "common/config.h"
 #include "../common/performance_utils.h"
@@ -195,3 +213,5 @@ class CorfuSequencerClient {
 		std::atomic<uint64_t> unavailable_retries_{0};
 		std::atomic<uint64_t> transient_retries_{0};
 };
+
+#endif

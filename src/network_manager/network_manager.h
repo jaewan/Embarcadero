@@ -1,5 +1,7 @@
 #ifndef EMBARCADERO_NETWORK_MANAGER_H_
 #define EMBARCADERO_NETWORK_MANAGER_H_
+#include "common/cancellable_queue.h"
+#include "network_manager/protocol.h"
 
 #include <array>
 #include <atomic>
@@ -24,21 +26,8 @@ class DiskManager;
 class Topic;
 class TopicManager;
 
-enum ClientRequestType {Publish, Subscribe};
-
 struct alignas(64) NetworkRequest {
     int client_socket;
-};
-
-struct alignas(64) EmbarcaderoReq {
-    uint32_t client_id;
-    uint32_t ack;
-    size_t num_msg;  // At Subscribe: used as last offset (set to -2 as sentinel value)
-                     // At Publish: used as num brokers
-    void* last_addr; // Subscribe: address of last fetched message
-    uint32_t port;
-    ClientRequestType client_req;
-    char topic[32];  // Sized to maintain overall 64B alignment
 };
 
 struct alignas(64) LargeMsgRequest {
@@ -93,19 +82,13 @@ private:
     void MainThread();
     void ReqReceiveThread();
     /** @param topic_cstr Topic name (converted to std::string internally for thread safety). */
-    void AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd,
+    void AckThread(std::string topic, uint32_t ack_level, int ack_fd, int ack_efd,
                    uint32_t client_id, uint32_t session_epoch);
     template <typename Callable, typename... Args>
     bool StartManagedThread(Callable&& callable, Args&&... args) {
-        if (stop_threads_.load(std::memory_order_acquire)) {
-            return false;
-        }
-
-        std::thread thread(std::forward<Callable>(callable), std::forward<Args>(args)...);
-        {
-            absl::MutexLock lock(&threads_mu_);
-            threads_.emplace_back(std::move(thread));
-        }
+        absl::MutexLock lock(&threads_mu_);
+        if (stop_threads_.load(std::memory_order_acquire)) return false;
+        threads_.emplace_back(std::forward<Callable>(callable), std::forward<Args>(args)...);
         return true;
     }
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
@@ -124,7 +107,7 @@ private:
     void UpdateWrittenForOrder0(TInode* tinode, Topic* topic, uint32_t client_id, uint64_t written_addr, uint32_t num_msg);
 
     // Thread-safe queues
-    folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;
+    CancellableQueue<std::optional<struct NetworkRequest>> request_queue_;
     folly::MPMCQueue<struct LargeMsgRequest> large_msg_queue_;
 
 

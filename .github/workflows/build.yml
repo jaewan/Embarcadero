@@ -1,0 +1,48 @@
+name: Build and supported tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 90
+    env:
+      EMBARCADERO_DISPOSABLE_ROOTFS: '1'
+      EMBARCADERO_BUILD_JOBS: '4'
+    steps:
+      - name: Prepare source checkout
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Bootstrap disposable environment
+        run: bash tools/build_support/bootstrap_ubuntu.sh
+      - name: Configure and build supported targets
+        run: |
+          cmake --preset debug -B /tmp/full
+          cmake --build /tmp/full -j4
+          ctest --test-dir /tmp/full --output-on-failure --timeout 120
+      - name: Build baseline-free client
+        run: |
+          cmake --preset client-minimal -B /tmp/minimal -DFETCHCONTENT_SOURCE_DIR_GRPC=/tmp/full/_deps/grpc-src
+          cmake --build /tmp/minimal --target throughput_test -j4
+          python3 tools/build_support/check_minimal_client.py /tmp/minimal
+      - name: Focused ASan and UBSan checks
+        run: |
+          cmake --preset asan-ubsan -B /tmp/asan -DFETCHCONTENT_SOURCE_DIR_GRPC=/tmp/full/_deps/grpc-src
+          cmake --build /tmp/asan --target configuration_safety_test network_safety_test bounded_reservation_test session_admission_test fault_control_test test_shared_mapping -j4
+          ctest --test-dir /tmp/asan -R '^(unit_configuration_safety|unit_network_safety|unit_bounded_reservation|unit_session_admission|unit_fault_control|shared_mapping)$' --output-on-failure --timeout 120
+      - name: Record provenance
+        if: always()
+        run: python3 tools/build_support/build_manifest.py /tmp/full --output /tmp/build-manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: build-evidence
+          path: |
+            /tmp/build-manifest.json
+            /tmp/full/test-inventory.txt
+            /tmp/full/Testing/Temporary/LastTest.log
+            /opt/embarcadero-deps/ubuntu-packages.tsv
+            /opt/embarcadero-deps/folly-revision.txt

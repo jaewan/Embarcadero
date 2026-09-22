@@ -3,9 +3,17 @@
 # End-to-End Tests (Shell scripts)
 # These run actual broker clusters and validate system behavior
 
+option(EMBARCADERO_ENABLE_UNSAFE_LEGACY_E2E
+    "Register legacy hardware scripts with unsafe shared-resource cleanup" OFF)
+if(EMBARCADERO_ENABLE_UNSAFE_LEGACY_E2E)
+    message(WARNING "Legacy E2E scripts can kill unrelated brokers and remove shared readiness files; run only on a dedicated test host")
+    set(_e2e_environment
+        "EMBARCADERO_TEST_BUILD_DIR=${CMAKE_BINARY_DIR}"
+        "EMBARCADERO_TEST_BROKER=$<TARGET_FILE:embarlet>"
+        "EMBARCADERO_TEST_CLIENT=$<TARGET_FILE:throughput_test>")
 # Add E2E tests as custom targets
 add_custom_target(test_e2e
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/run_all.sh
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} -L legacy_e2e --output-on-failure
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running end-to-end tests"
     VERBATIM
@@ -21,42 +29,49 @@ add_custom_target(test_e2e
 
 add_test(
     NAME e2e_explicit_replication_order5_ack2
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_explicit_replication_order5_ack2.sh
+    COMMAND ${CMAKE_COMMAND} -E env ${_e2e_environment} bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_explicit_replication_order5_ack2.sh
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
 add_test(
     NAME e2e_order5_live_session_fence_fire
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_order5_live_session_fence_fire.sh
+    COMMAND ${CMAKE_COMMAND} -E env ${_e2e_environment} bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_order5_live_session_fence_fire.sh
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
 add_test(
     NAME e2e_order5_multibroker_unacked_release
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_order5_multibroker_unacked_release.sh
+    COMMAND ${CMAKE_COMMAND} -E env ${_e2e_environment} bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_order5_multibroker_unacked_release.sh
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
 # Set test properties
 set_tests_properties(e2e_explicit_replication_order5_ack2 PROPERTIES
     TIMEOUT 600  # 10 minutes max (replication may take longer)
-    LABELS "e2e;replication;order5;ack2"
+    RUN_SERIAL TRUE
+    LABELS "legacy_e2e;e2e;replication;order5;ack2"
 )
 
 set_tests_properties(e2e_order5_live_session_fence_fire PROPERTIES
     TIMEOUT 180
-    LABELS "e2e;order5;session;fencing;correctness"
+    RUN_SERIAL TRUE
+    LABELS "legacy_e2e;e2e;order5;session;fencing;correctness"
 )
 
 set_tests_properties(e2e_order5_multibroker_unacked_release PROPERTIES
     TIMEOUT 180
-    LABELS "e2e;order5;session;multibroker;correctness"
+    RUN_SERIAL TRUE
+    LABELS "legacy_e2e;e2e;order5;session;multibroker;correctness"
 )
 
+endif()
+
 # Unit tests
-find_package(PkgConfig QUIET)
+find_package(PkgConfig REQUIRED)
 if(PkgConfig_FOUND)
-    pkg_check_modules(GTEST gtest)
+    pkg_check_modules(GTEST REQUIRED gtest)
+    find_path(GMOCK_INCLUDE_DIR gmock/gmock.h REQUIRED)
+    list(APPEND GTEST_INCLUDE_DIRS "${GMOCK_INCLUDE_DIR}")
     if(GTEST_FOUND)
         message(STATUS "GTest found via pkg-config, enabling unit tests")
         
@@ -158,6 +173,7 @@ if(PkgConfig_FOUND)
         target_link_libraries(replication_topology_test PRIVATE
             ${GTEST_LIBRARIES}
             ${GTEST_MAIN_LIB}
+            glog::glog
             pthread
         )
         add_test(NAME unit_replication_topology COMMAND replication_topology_test)
@@ -564,6 +580,7 @@ if(PkgConfig_FOUND)
         )
         target_compile_options(order5_publisher_rollover_test PRIVATE ${GTEST_CFLAGS_OTHER})
         target_link_libraries(order5_publisher_rollover_test PRIVATE
+            lazylog_metadata_grpc_proto
             ${GTEST_LIBRARIES}
             ${GTEST_MAIN_LIB}
             glog::glog
@@ -609,6 +626,7 @@ if(PkgConfig_FOUND)
         )
         target_compile_options(order5_subscriber_reorder_test PRIVATE ${GTEST_CFLAGS_OTHER})
         target_link_libraries(order5_subscriber_reorder_test PRIVATE
+            lazylog_metadata_grpc_proto
             ${GTEST_LIBRARIES}
             ${GTEST_MAIN_LIB}
             glog::glog
@@ -657,14 +675,114 @@ if(PkgConfig_FOUND)
             LABELS "unit;baseline;transport;equivalence;scalog;lazylog;correctness"
         )
     else()
-        message(WARNING "GTest not found via pkg-config, unit tests disabled")
+        message(FATAL_ERROR "BUILD_TESTING requires GTest")
     endif()
 else()
-    message(WARNING "pkg-config not found, unit tests disabled")
+    message(FATAL_ERROR "BUILD_TESTING requires pkg-config")
 endif()
 
 # Test output directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test_output)
 
 # Add test dependencies
-add_dependencies(test_e2e embarlet throughput_test)
+if(TARGET test_e2e)
+    add_dependencies(test_e2e embarlet throughput_test)
+endif()
+
+# Small production configuration/layout checks; no shared-region allocation.
+add_executable(configuration_safety_test
+    configuration_safety_test.cc
+    ../src/common/configuration.cc)
+target_include_directories(configuration_safety_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR} ${GTEST_INCLUDE_DIRS})
+target_link_libraries(configuration_safety_test PRIVATE
+    ${GTEST_LIBRARIES} ${GTEST_MAIN_LIB} yaml-cpp glog::glog heartbeat_grpc_proto Threads::Threads)
+add_test(NAME unit_configuration_safety COMMAND configuration_safety_test)
+set_tests_properties(unit_configuration_safety PROPERTIES
+    TIMEOUT 60 LABELS "unit;configuration;layout;correctness")
+
+# Production reservation primitives exercised without a broker or large mapping.
+add_executable(bounded_reservation_test bounded_reservation_test.cc)
+target_include_directories(bounded_reservation_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(bounded_reservation_test PRIVATE Threads::Threads atomic)
+add_test(NAME unit_bounded_reservation COMMAND bounded_reservation_test)
+set_tests_properties(unit_bounded_reservation PROPERTIES
+    TIMEOUT 60 LABELS "unit;reservation;capacity;correctness")
+
+add_executable(chain_shutdown_test
+    chain_shutdown_test.cc ../src/disk_manager/chain_replication.cc)
+target_include_directories(chain_shutdown_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR} ${GTEST_INCLUDE_DIRS})
+target_link_libraries(chain_shutdown_test PRIVATE
+    ${GTEST_LIBRARIES} ${GTEST_MAIN_LIB} glog::glog heartbeat_grpc_proto Threads::Threads)
+add_test(NAME unit_chain_shutdown COMMAND chain_shutdown_test)
+set_tests_properties(unit_chain_shutdown PROPERTIES
+    TIMEOUT 10 LABELS "unit;replication;shutdown;correctness")
+
+add_executable(network_safety_test network_safety_test.cc)
+target_include_directories(network_safety_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR} ${GTEST_INCLUDE_DIRS})
+target_link_libraries(network_safety_test PRIVATE
+    ${GTEST_LIBRARIES} ${GTEST_MAIN_LIB} heartbeat_grpc_proto Threads::Threads)
+add_test(NAME unit_network_safety COMMAND network_safety_test)
+set_tests_properties(unit_network_safety PROPERTIES
+    TIMEOUT 30 LABELS "unit;network;framing;shutdown;correctness")
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME unit_dev_runner
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_dev_cluster.py)
+set_tests_properties(unit_dev_runner PROPERTIES
+    TIMEOUT 30 LABELS "unit;runner;cleanup;correctness")
+
+add_test(NAME unit_perf_compare
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_perf_compare.py)
+add_test(NAME unit_perf_analysis
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_analyze_perf_comparison.py)
+set_tests_properties(unit_perf_compare unit_perf_analysis PROPERTIES
+    TIMEOUT 30 LABELS "unit;performance;measurement;correctness")
+
+foreach(admission IN ITEMS session_admission single_topic_admission)
+    add_executable(${admission}_test ${admission}_test.cc)
+    target_include_directories(${admission}_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(${admission}_test PRIVATE Threads::Threads)
+    add_test(NAME unit_${admission} COMMAND ${admission}_test)
+    set_tests_properties(unit_${admission} PROPERTIES TIMEOUT 30 LABELS "unit;admission;correctness")
+endforeach()
+
+add_executable(test_shared_mapping shared_mapping_test.cc)
+target_include_directories(test_shared_mapping PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_shared_mapping PRIVATE Threads::Threads)
+add_test(NAME shared_mapping COMMAND test_shared_mapping)
+set_tests_properties(shared_mapping PROPERTIES TIMEOUT 10 LABELS "unit;layout")
+
+add_executable(fault_control_test fault_control_test.cc ${PROJECT_SOURCE_DIR}/src/common/fault_injection.cc)
+target_include_directories(fault_control_test PRIVATE ${PROJECT_SOURCE_DIR}/src ${GTEST_INCLUDE_DIRS})
+target_compile_definitions(fault_control_test PRIVATE EMBARCADERO_ENABLE_FAULT_INJECTION=1)
+target_link_libraries(fault_control_test PRIVATE ${GTEST_LIBRARIES} ${GTEST_MAIN_LIB} Threads::Threads)
+add_test(NAME unit_fault_control COMMAND fault_control_test)
+set_tests_properties(unit_fault_control PROPERTIES TIMEOUT 30 LABELS "unit;fault-control;correctness")
+
+add_executable(production_fault_driver integration/production_fault_driver.cc
+    integration/production_fault_support.cc integration/session_fault_scenarios.cc
+    integration/replication_fault_scenarios.cc integration/session_capacity_scenario.cc
+    integration/storage_fault_scenarios.cc)
+target_include_directories(production_fault_driver PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR})
+target_link_libraries(production_fault_driver PRIVATE embarcadero_configuration heartbeat_grpc_proto
+    session_proto cxl_transport grpc++ protobuf::libprotobuf glog::glog Threads::Threads)
+set_target_properties(production_fault_driver PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+add_test(NAME unit_production_fault_driver COMMAND production_fault_driver --self-test)
+set_tests_properties(unit_production_fault_driver PROPERTIES TIMEOUT 30 LABELS "unit;protocol;correctness")
+
+add_executable(test_support_contract support_contract_test.cc)
+target_include_directories(test_support_contract PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME unit_support_contract COMMAND test_support_contract)
+set_tests_properties(unit_support_contract PROPERTIES TIMEOUT 10 LABELS "unit;support-contract;correctness")
+
+add_test(NAME unit_production_fault_harness
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${PROJECT_SOURCE_DIR}/tools -p test_production_faults.py)
+set_tests_properties(unit_production_fault_harness PROPERTIES TIMEOUT 30 LABELS "unit;integration-harness")
+
+add_executable(test_memory_replica_sink memory_replica_sink_test.cc)
+target_include_directories(test_memory_replica_sink PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME unit_memory_replica_sink COMMAND test_memory_replica_sink)
+set_tests_properties(unit_memory_replica_sink PROPERTIES TIMEOUT 10 LABELS "unit;replication;correctness")

@@ -1,3 +1,4 @@
+#include "common/support_contract.h"
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/types.h>
@@ -11,6 +12,8 @@
 #include <filesystem>
 #include <iostream>
 #include <chrono>
+#include <charconv>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <vector>
@@ -18,6 +21,7 @@
 #include "mimalloc.h"
 
 #include "disk_manager.h"
+#include "memory_replica_sink.h"
 #include "scalog_replication_manager.h"
 #include "corfu_replication_manager.h"
 #include "chain_replication.h"
@@ -73,57 +77,6 @@ namespace Embarcadero{
 		std::memcpy(d, s, size % 64);
 	}
 
-	unsigned long default_huge_page_size(void){
-		FILE *f = fopen("/proc/meminfo", "r");
-		unsigned long hps = 0;
-		size_t linelen = 0;
-		char *line = NULL;
-
-		if (!f)
-			return 0;
-		while (getline(&line, &linelen, f) > 0) {
-			if (sscanf(line, "Hugepagesize:       %lu kB", &hps) == 1) {
-				hps <<= 10;
-				break;
-			}
-		}
-		free(line);
-		fclose(f);
-		return hps;
-	}
-
-#define ALIGN_UP(x, align_to)   (((x) + ((align_to)-1)) & ~((align_to)-1))
-
-	void *mmap_large_buffer(size_t need, size_t &allocated){
-		void *buffer;
-		size_t sz;
-		size_t map_align = default_huge_page_size();
-		/* Attempt to use huge pages if possible. */
-		sz = ALIGN_UP(need, map_align);
-		buffer = mmap(NULL, sz, PROT_READ | PROT_WRITE,
-				MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-
-		if (buffer == (void *)-1) {
-			sz = need;
-			buffer = mmap(NULL, sz, PROT_READ | PROT_WRITE,
-					MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,-1, 0);
-			if (buffer != (void *)-1){
-				LOG(INFO) <<"MAP_HUGETLB attempt failed, look at /sys/kernel/mm/hugepages for optimal performance";
-			}else{
-				LOG(ERROR) <<"mmap failed:" << strerror(errno);
-				buffer = mi_malloc(need);
-				if(buffer){
-					LOG(ERROR) <<"malloc failed:" << strerror(errno);
-					exit(1);
-				}
-			}
-		}
-
-		allocated = sz;
-		memset(buffer, 0, sz);
-		return buffer;
-	}
-
 	DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, 
 			heartbeat_system::SequencerType sequencerType, size_t queueCapacity):
 		requestQueue_(queueCapacity),
@@ -173,26 +126,29 @@ namespace Embarcadero{
 				// - EMBARCADERO_REPLICATION_FACTOR: Total number of replicas (including head)
 				// - EMBARCADERO_REPLICA_DISK_PATH: Disk path for replica data (optional)
 
-				const char* replica_id_env = getenv("EMBARCADERO_REPLICA_ID");
-				const char* replication_factor_env = getenv("EMBARCADERO_REPLICATION_FACTOR");
-				const char* disk_path_env = getenv("EMBARCADERO_REPLICA_DISK_PATH");
-
-				int replica_id = replica_id_env ? atoi(replica_id_env) : 0;
-				// Default 0: replication threads are disabled unless explicitly configured.
-				// This keeps ACK=1 / non-replicated runs free of chain-replication overhead.
-				int replication_factor = replication_factor_env ? atoi(replication_factor_env) : 0;
-				int num_brokers = 4;
-				if (const char* env = getenv("NUM_BROKERS")) {
-					int parsed = atoi(env);
-					if (parsed > 0 && parsed <= NUM_MAX_BROKERS) {
-						num_brokers = parsed;
-					}
-				} else if (const char* env = getenv("EMBARCADERO_NUM_BROKERS")) {
-					int parsed = atoi(env);
-					if (parsed > 0 && parsed <= NUM_MAX_BROKERS) {
-						num_brokers = parsed;
-					}
-				}
+                const auto nonnegative_env = [](const char* name, int fallback) {
+                    const char* value = std::getenv(name);
+                    if (!value) return fallback;
+                    int parsed = 0;
+                    const auto result = std::from_chars(value, value + std::strlen(value), parsed);
+                    if (result.ec != std::errc{} || result.ptr != value + std::strlen(value) || parsed < 0)
+                        throw std::invalid_argument(std::string(name) + " must be a nonnegative integer");
+                    return parsed;
+                };
+                const int replica_id = nonnegative_env("EMBARCADERO_REPLICA_ID", 0);
+                const int replication_factor = nonnegative_env("EMBARCADERO_REPLICATION_FACTOR", 0);
+                const int num_brokers = std::getenv("NUM_BROKERS") ? nonnegative_env("NUM_BROKERS", 0) :
+                    nonnegative_env("EMBARCADERO_NUM_BROKERS", NUM_MAX_BROKERS_CONFIG);
+                if (num_brokers <= 0 || num_brokers > NUM_MAX_BROKERS_CONFIG ||
+                    replication_factor > num_brokers || broker_id_ < 0 || broker_id_ >= num_brokers)
+                    throw std::invalid_argument("chain replication RF/broker count exceeds configured topology");
+                if (replication_factor == 0 || ShouldUseUnifiedReplicationPath()) {
+                    LOG(INFO) << "DiskManager: Chain replication disabled (replication_factor="
+                              << replication_factor << ", unified_replication_path="
+                              << ShouldUseUnifiedReplicationPath() << ")";
+                    return;
+                }
+                const char* disk_path_env = std::getenv("EMBARCADERO_REPLICA_DISK_PATH");
 
 				const Embarcadero::ChainReplicationConfig chain_cfg =
 					Embarcadero::ParseChainReplicationConfig();
@@ -225,6 +181,7 @@ namespace Embarcadero{
 						replica_id, replication_factor, broker_id_, num_brokers, cxl_addr_, goi, cv, disk_path);
 					chain_replication_manager_->Start();
 					chain_replication_factor_ = replication_factor;
+                    chain_replication_brokers_ = num_brokers;
 
 					LOG(INFO) << "DiskManager: Chain replication enabled (replica_id=" << replica_id
 					          << ", broker_id=" << broker_id_
@@ -261,13 +218,10 @@ namespace Embarcadero{
 
 	DiskManager::~DiskManager(){
 		stop_threads_ = true;
-		std::optional<struct ReplicationRequest> sentinel = std::nullopt;
-		std::optional<struct MemcpyRequest> copy_sentinel = std::nullopt;
-		size_t n = num_io_threads_.load();
-		for (size_t i=0; i<n; i++){
-			requestQueue_.blockingWrite(sentinel);
-			copyQueue_.blockingWrite(copy_sentinel);
-		}
+        for (const auto& pending : requestQueue_.close()) {
+            if (pending && pending->fd >= 0) close(pending->fd);
+        }
+        copyQueue_.close();
 
 		for(std::thread& thread : threads_){
 			if(thread.joinable()){
@@ -294,7 +248,7 @@ namespace Embarcadero{
 		if(log_to_memory_){
 			while(!stop_threads_){
 				std::optional<MemcpyRequest> optReq;
-				copyQueue_.blockingRead(optReq);
+				if (!copyQueue_.pop(optReq)) return;
 				if(!optReq.has_value()){
 					return;
 				}
@@ -304,7 +258,7 @@ namespace Embarcadero{
 		}else{
 			while(!stop_threads_){
 				std::optional<MemcpyRequest> optReq;
-				copyQueue_.blockingRead(optReq);
+				if (!copyQueue_.pop(optReq)) return;
 				if(!optReq.has_value()){
 					return;
 				}
@@ -319,42 +273,34 @@ namespace Embarcadero{
 		}
 	}
 
-	void DiskManager::EnsureTopicReplicationFactor(int topic_replication_factor) {
-		if (topic_replication_factor < 0) {
-			LOG(FATAL) << "DiskManager::EnsureTopicReplicationFactor: invalid topic RF="
-			           << topic_replication_factor;
-		}
-		if (topic_replication_factor == 0) {
-			return;
-		}
-		if (chain_replication_manager_ == nullptr) {
-			// Chain not started at broker boot (env RF=0). Topic RF is authoritative:
-			// require EMBARCADERO_REPLICATION_FACTOR to match before ACK2 can be claimed.
-			if (topic_replication_factor >= Embarcadero::kMinReplicationFactorForAck2) {
-				LOG(ERROR) << "DiskManager::EnsureTopicReplicationFactor: topic RF="
-				           << topic_replication_factor
-				           << " but chain replication is not running. Set "
-				           << "EMBARCADERO_REPLICATION_FACTOR=" << topic_replication_factor
-				           << " at broker start (per-topic RF must match durable replica path).";
-			}
-			return;
-		}
-		if (chain_replication_factor_ != topic_replication_factor) {
-			LOG(FATAL) << "DiskManager::EnsureTopicReplicationFactor: topic RF="
-			           << topic_replication_factor
-			           << " conflicts with chain replication RF="
-			           << chain_replication_factor_
-			           << " (from EMBARCADERO_REPLICATION_FACTOR). Fail closed.";
-		}
-	}
+    bool DiskManager::ValidateTopicReplication(int order, int rf, int live_brokers,
+            heartbeat_system::SequencerType sequencer, std::string& error) const {
+        if (sequencer != sequencerType_) {
+            error = "topic sequencer differs from the broker's configured sequencer";
+            return false;
+        }
+        if (sequencer != heartbeat_system::EMBARCADERO) return true;
+        const auto validation = Embarcadero::ValidateChainAdmission(order, rf,
+            ShouldUseUnifiedReplicationPath(), chain_replication_manager_ != nullptr,
+            chain_replication_factor_, chain_replication_brokers_, live_brokers);
+        error = validation.error;
+        return validation.ok;
+    }
 
-	void DiskManager::Replicate(TInode* topic_inode, TInode* replica_tinode, int replication_factor){
+	bool DiskManager::Replicate(TInode* topic_inode, TInode* replica_tinode, int replication_factor, int num_brokers){
+        if (!topic_inode || replication_factor < 0 || num_brokers <= 0 ||
+            num_brokers > NUM_MAX_BROKERS_CONFIG || replication_factor > num_brokers ||
+            broker_id_ < 0 || broker_id_ >= num_brokers) {
+            LOG(ERROR) << "Replication admission rejected: invalid RF/topology; refusing to clamp";
+            return false;
+        }
+        if (replication_factor == 0) return true;
 		// ORDER=5 (strong) on EMBARCADERO uses GOI + chain replication + CompletionVector.
 		// Do not start legacy batch-ring replication workers on this path.
 		if (sequencerType_ == heartbeat_system::SequencerType::EMBARCADERO &&
 		    topic_inode != nullptr && topic_inode->order == kOrderStrong &&
 		    !ShouldUseUnifiedReplicationPath()) {
-			return;
+			return true;
 		}
 
 		// Ensure we have at least one replication worker per requested replica stream.
@@ -371,30 +317,7 @@ namespace Embarcadero{
 				std::this_thread::yield();
 			}
 		}
-		// Resolve live broker count (required for correct modulo replication set computation).
-		int num_brokers = NUM_MAX_BROKERS;
-		if (get_num_brokers_callback_) {
-			const int live_brokers = get_num_brokers_callback_();
-			if (live_brokers > 0 && live_brokers <= NUM_MAX_BROKERS) {
-				num_brokers = live_brokers;
-			}
-		}
-		if (num_brokers <= 0) {
-			LOG(WARNING) << "DiskManager::Replicate: invalid num_brokers=" << num_brokers
-			             << ", falling back to NUM_MAX_BROKERS";
-			num_brokers = NUM_MAX_BROKERS;
-		}
-
-		int effective_replication_factor = replication_factor;
-		if (effective_replication_factor > num_brokers) {
-			LOG(WARNING) << "DiskManager::Replicate: replication_factor=" << replication_factor
-			             << " exceeds num_brokers=" << num_brokers
-			             << ", clamping to " << num_brokers;
-			effective_replication_factor = num_brokers;
-		}
-		if (effective_replication_factor <= 0) {
-			return;
-		}
+        const int effective_replication_factor = replication_factor;
 
 		// For source broker S, ACK2 reads min across forward set {S, S+1, ..., S+rf-1}.
 		// Therefore local broker L must replicate exactly those sources S where L is in S's set:
@@ -437,15 +360,16 @@ namespace Embarcadero{
 					           << " error=" << strerror(errno);
 				}
 				ReplicationRequest req = {topic_inode, replica_tinode, fd, b};
-				requestQueue_.blockingWrite(req);
+				if (!requestQueue_.push(req) && req.fd >= 0) close(req.fd);
 			}
 		}else{
 			for(int i = 0; i< effective_replication_factor; i++){
 				int b = source_brokers[i];
 				ReplicationRequest req = {topic_inode, replica_tinode, -1, b};
-				requestQueue_.blockingWrite(req);
+				if (!requestQueue_.push(req) && req.fd >= 0) close(req.fd);
 			}
 		}
+	    return true;
 	}
 
 	// Replicate req.tinode->topic req.broker_id's log to local disk
@@ -455,7 +379,10 @@ namespace Embarcadero{
 		thread_count_.fetch_add(1, std::memory_order_relaxed);
 		std::optional<struct ReplicationRequest> optReq;
 
-		requestQueue_.blockingRead(optReq);
+        if (!requestQueue_.pop(optReq)) {
+            thread_count_.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
 		if(!optReq.has_value()){
 			thread_count_.fetch_sub(1);
 			return;
@@ -468,16 +395,19 @@ namespace Embarcadero{
 		LOG(INFO) << "[ReplicateThread]: Starting replication for broker_id=" << req.broker_id
 			<< " (replicating broker " << req.broker_id << "'s log)";
 
-		void *log_addr = nullptr;
-		size_t log_capacity = (1UL<<30);
-		int fd = req.fd;
-
-		if(log_to_memory_){
-			log_addr = mi_malloc(log_capacity);
-		}
+        // Volatile overwrite sink: completion means a bounded memory copy,
+        // not persistence or retained history.
+        MemoryReplicaSink memory_sink(log_to_memory_ ? (size_t{1} << 30) : 0,
+                                      mi_malloc, mi_free);
+        int fd = req.fd;
+        if (log_to_memory_ && !memory_sink.ready()) {
+            LOG(ERROR) << "Memory replica allocation failed; refusing replication progress";
+            thread_count_.fetch_sub(1);
+            num_active_threads_.fetch_sub(1);
+            return;
+        }
 
 		// Common variables for both memory and disk paths
-		size_t offset = 0;
 		size_t disk_offset = 0;
 		
 		// [[EXPLICIT_REPLICATION_STAGE4]] - Batch-based replication variables
@@ -517,13 +447,14 @@ namespace Embarcadero{
 				// Write batch payload to disk (with proper short-write handling)
 				if (batch_payload_size > 0) {
 					if(log_to_memory_){
-						memcpy((uint8_t*)log_addr + offset, batch_payload, batch_payload_size);
-						offset += batch_payload_size;
-						if (offset > log_capacity) offset = 0;
+                        if (!memory_sink.Append(batch_payload, batch_payload_size)) {
+                            LOG(ERROR) << "Memory replica batch exceeds sink capacity; refusing replication progress";
+                            batch_write_success = false;
+                        }
 					}else{
 						// [[FIX-SHORT-WRITES]] - Handle partial writes and EINTR properly
 						size_t bytes_written_total = 0;
-						while (bytes_written_total < batch_payload_size) {
+						while (bytes_written_total < batch_payload_size && !stop_threads_.load(std::memory_order_acquire)) {
 							size_t bytes_remaining = batch_payload_size - bytes_written_total;
 							const uint8_t* src = reinterpret_cast<const uint8_t*>(batch_payload) + bytes_written_total;
 							off_t current_pos = disk_offset + bytes_written_total;
@@ -568,6 +499,10 @@ namespace Embarcadero{
 						}
 					}
 				}
+
+                // Cancellation of a retry loop is not sink completion. Never
+                // convert an interrupted partial write into a durability ACK.
+                if (stop_threads_.load(std::memory_order_acquire)) batch_write_success = false;
 
 				// Do not amortize this sync across batches: doing so would expose a
 				// replication_done value for data that was merely in the page cache.
@@ -680,7 +615,7 @@ namespace Embarcadero{
 			} else {
 				// Batch write failed - for permanent errors, exit thread fail-fast
 				// The thread will clean up and exit below
-				LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: Permanent disk write error, terminating replication thread";
+				LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: Sink write failed, terminating replication thread";
 				break;  // Exit main loop
 			}
 			} else {
@@ -704,25 +639,8 @@ namespace Embarcadero{
 	// --- Cleanup ---
 	VLOG(1) << "[ReplicateThread " << req.broker_id << "]: Stopping replication loop.";
 
-	// Cleanup based on log type
-	if (!log_to_memory_) {
-		// Disk path cleanup - log_addr is malloc'd buffer, not mmap
-		// [[REFACTOR_DEAD_PATHS]] - Removed misleading msync() call
-		// log_addr in disk mode is a simple malloc'd buffer for staging (not used in final implementation)
-		// No need for msync since we use pwrite() directly to disk
-		if (log_addr != nullptr) {
-			VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Freeing staging buffer.";
-			mi_free(log_addr);
-		}
-		close(fd);
-	} else {
-		// Memory path cleanup
-		if (log_addr != nullptr) {
-			VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Freeing memory log.";
-			mi_free(log_addr); // Use the corresponding free function for mi_malloc
-		}
-		// req.fd should be -1 for memory path, no need to close
-	}
+    // The memory sink owns its allocation; disk requests own their descriptor.
+    if (!log_to_memory_) close(fd);
 
 		// Decrement counters (ensure this happens exactly once per thread exit)
 		thread_count_.fetch_sub(1);

@@ -305,6 +305,9 @@ class Subscriber {
 			std::vector<LatencySample> SnapshotLatencySamples();
 			void DEBUG_wait(size_t total_msg_size, size_t msg_size);
 		bool DEBUG_check_order(int order);
+        // Opt-in benchmark audit through the real ordered consumer, including payload bytes.
+        bool AuditOrderedDelivery(size_t expected_messages, const void* expected_payload,
+                                  size_t payload_size, int timeout_ms = 20000, bool indexed_payload = false);
 		/**
 		 * Debug method to wait for a certain amount of data
 		 * @param total_msg_size Total size of all messages
@@ -516,6 +519,9 @@ class Subscriber {
 		absl::Mutex owned_message_pool_mutex_;
 		std::vector<std::unique_ptr<OwnedMessage>> owned_message_pool_ ABSL_GUARDED_BY(owned_message_pool_mutex_);
 		size_t next_expected_order_ ABSL_GUARDED_BY(consume_mutex_){0};
+        size_t ordered_received_messages_ ABSL_GUARDED_BY(consume_mutex_){0};
+        size_t ordered_duplicate_messages_ ABSL_GUARDED_BY(consume_mutex_){0};
+        std::atomic<size_t> ordered_parse_errors_{0};
 		std::deque<OwnedMessagePtr> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
 		size_t pending_messages_base_order_ ABSL_GUARDED_BY(consume_mutex_){0};
 		// [[ORDER_GAP_DIAG]] Tracks how long next_expected_order_ has been stuck so a

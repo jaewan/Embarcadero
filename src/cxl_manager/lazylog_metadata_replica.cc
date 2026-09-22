@@ -291,7 +291,13 @@ void LazyLogMetadataReplicaClient::EnsureStubs() const {
   for (const auto& endpoint : endpoints_) {
     ReplicaStub rs;
     rs.endpoint = endpoint;
-    rs.channel = grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
+    // Align reconnect readiness with the bounded application retry budget.
+    // gRPC's default initial backoff can outlast all short RPC attempts.
+    grpc::ChannelArguments args;
+    args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 50);
+    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 50);
+    args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 1000);
+    rs.channel = grpc::CreateCustomChannel(endpoint, grpc::InsecureChannelCredentials(), args);
     rs.stub = lazylogmetadata::LazyLogMetadataReplica::NewStub(rs.channel);
     stubs_.push_back(std::move(rs));
   }
@@ -324,6 +330,7 @@ bool LazyLogMetadataReplicaClient::AppendToAll(
       for (uint32_t attempt = 1; attempt <= attempts; ++attempt) {
         grpc::ClientContext context;
         context.set_deadline(std::chrono::system_clock::now() + timeout);
+        context.set_wait_for_ready(true);
         lazylogmetadata::MetadataAppendResponse response;
         const grpc::Status status =
             stub->stub->AppendMetadata(&context, request, &response);

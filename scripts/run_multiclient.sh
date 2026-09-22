@@ -37,6 +37,64 @@
 
 set -euo pipefail
 
+# Supported local development route. Dispatch before backend checks, legacy
+# locks, sourced helpers, traps, SSH, or research-host cleanup. argparse in the
+# owned runner validates every forwarded argument before its preflight/actions.
+case "${1:-}" in
+    --dev-dram)
+        shift
+        _dev_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+        exec python3 "${_dev_repo_root}/tools/dev_cluster.py" "$@"
+        ;;
+    --help|-h)
+        cat <<'HELP'
+Usage:
+  scripts/run_multiclient.sh --dev-dram [dev_cluster.py options]
+  scripts/run_multiclient.sh --dev-dram --help
+  NUM_CLIENTS=... NUM_BROKERS=... scripts/run_multiclient.sh
+
+--dev-dram is the supported local development route: explicit DRAM emulation,
+local NUMA-bound client, owned processes/region, no SSH or host tuning.
+Example: --dev-dram --build-dir build/debug --brokers 3 --dry-run
+
+The environment-driven command without --dev-dram is the historical research
+launcher. It uses machine-specific SSH topology and legacy broker cleanup;
+run it only in a dedicated research environment. Its default backend is real.
+See docs/development-commands.md for supported smoke, fault, and pilot commands.
+HELP
+        exit 0
+        ;;
+    "") ;;
+    *) echo "ERROR: unknown argument '$1'; use --help or --dev-dram --help" >&2; exit 2 ;;
+esac
+
+# Explicit memory backend, independent of the replication sink. Keep the
+# historical real default, but never silently label a DRAM-only host as CXL.
+MEMORY_BACKEND="${EMBARCADERO_MEMORY_BACKEND:-real}"
+declare -a MEMORY_BACKEND_ARGS=()
+case "$MEMORY_BACKEND" in
+    emul) MEMORY_BACKEND_ARGS=(--emul) ;;
+    real) ;;
+    *) echo "ERROR: EMBARCADERO_MEMORY_BACKEND must be real or emul" >&2; exit 2 ;;
+esac
+if [[ "$MEMORY_BACKEND" == "real" && "${DRY_RUN:-0}" != "1" ]]; then
+    _backend_device="${EMBARCADERO_CXL_DEVICE:-/dev/dax0.0}"
+    _backend_node="${EMBARCADERO_CXL_NUMA_NODE:-2}"
+    if [[ ! "$_backend_node" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: EMBARCADERO_CXL_NUMA_NODE must be a NUMA node number" >&2
+        exit 2
+    fi
+    _backend_node_path="/sys/devices/system/node/node${_backend_node}"
+    if [[ ! ( -c "$_backend_device" && -r "$_backend_device" && -w "$_backend_device" ) ]] &&
+       [[ ! -f "$_backend_node_path/cpulist" || -n "$(cat "$_backend_node_path/cpulist" 2>/dev/null)" ]]; then
+        echo "ERROR: real backend requires an accessible DAX device or the configured zero-core CXL NUMA node." >&2
+        echo "       Set EMBARCADERO_MEMORY_BACKEND=emul for DRAM. For isolated development use tools/dev_cluster.py." >&2
+        echo "       Custom real hardware must set EMBARCADERO_CXL_DEVICE / EMBARCADERO_CXL_NUMA_NODE explicitly." >&2
+        exit 1
+    fi
+    unset _backend_device _backend_node _backend_node_path
+fi
+
 RUN_LOCK_FILE="${RUN_LOCK_FILE:-/tmp/embarcadero_run_multiclient.lock}"
 exec {RUN_LOCK_FD}>"$RUN_LOCK_FILE"
 if ! flock -n "$RUN_LOCK_FD"; then
@@ -458,7 +516,7 @@ if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
     # through DAX *or* through the shared mapping whose pages are mbound to a
     # zero-core CXL NUMA node. Do not reject the latter: this machine's default
     # CXL deployment uses it. A dry run must remain hardware-independent.
-    if [[ "$DRY_RUN" != "1" && -n "${EMBARCADERO_CXL_DEVICE:-}" && ! -c "${EMBARCADERO_CXL_DEVICE}" ]]; then
+    if [[ "$MEMORY_BACKEND" == "real" && "$DRY_RUN" != "1" && -n "${EMBARCADERO_CXL_DEVICE:-}" && ! -c "${EMBARCADERO_CXL_DEVICE}" ]]; then
         echo "ERROR: EMBARCADERO_CXL_DEVICE must be a DAX character device when set: ${EMBARCADERO_CXL_DEVICE}" >&2
         exit 1
     fi
@@ -726,9 +784,10 @@ if [[ "$SEQUENCER" == "LAZYLOG" && -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; t
 fi
 
 _default_mb="$(embar_default_numa_membind)"
+[[ "$MEMORY_BACKEND" == "emul" ]] && _default_mb=1
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=${_default_mb}}"
 unset _default_mb
-[[ "$SEQUENCER" == "CORFU" ]] && EMBARLET_NUMA_BIND=""
+[[ "$SEQUENCER" == "CORFU" && "$MEMORY_BACKEND" == "real" ]] && EMBARLET_NUMA_BIND=""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -888,7 +947,8 @@ print_dry_run() {
     echo "DRY_RUN=1: no processes will be started."
     echo "CONTROL_TRANSPORT=$CONTROL_TRANSPORT SEQUENCER=$SEQUENCER RF=$REPLICATION_FACTOR REMOTE_REPLICAS=$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )) ACK=$ACK BATCH_SIZE=$EMBARCADERO_BATCH_SIZE CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB CORFU_TOKEN_DELAY_US=$CORFU_TOKEN_DELAY_US"
     echo "BUILD_BIN=$BUILD_BIN"
-    echo "BROKER_COMMAND=$BUILD_BIN/embarlet --broker_id <0..$((NUM_BROKERS - 1))>"
+    echo "MEMORY_BACKEND=$MEMORY_BACKEND (requested; dry-run does not verify hardware)"
+    echo "BROKER_COMMAND=$EMBARLET_NUMA_BIND $BUILD_BIN/embarlet ${MEMORY_BACKEND_ARGS[*]} --config $BROKER_CONFIG_ABS --head (followers omit --head)"
     if [[ -n "$seq_bin" ]]; then
         echo "SEQUENCER_COMMAND=$BUILD_BIN/$seq_bin"
     else
@@ -1379,7 +1439,9 @@ cleanup() {
         done
     fi
 }
-trap cleanup EXIT
+if [[ "$DRY_RUN" != "1" ]]; then
+    trap cleanup EXIT
+fi
 
 start_brokers() {
     START_BROKERS_FAILURE_REASON=""
@@ -1612,12 +1674,12 @@ start_brokers() {
     local head_fdatasync_stall_ms="${EMBARCADERO_FDATASYNC_STALL_MS_BROKER_0:-${EMBARCADERO_FDATASYNC_STALL_MS:-}}"
     if [[ -n "$head_fdatasync_stall_ms" ]]; then
         # shellcheck disable=SC2086
-        EMBARCADERO_FDATASYNC_STALL_MS="$head_fdatasync_stall_ms" $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+        EMBARCADERO_FDATASYNC_STALL_MS="$head_fdatasync_stall_ms" $EMBARLET_NUMA_BIND ./embarlet "${MEMORY_BACKEND_ARGS[@]}" --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
             --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
             > /tmp/broker_0.log 2>&1 &
     else
         # shellcheck disable=SC2086
-        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+        $EMBARLET_NUMA_BIND ./embarlet "${MEMORY_BACKEND_ARGS[@]}" --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
             --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
             > /tmp/broker_0.log 2>&1 &
     fi
@@ -1683,12 +1745,12 @@ start_brokers() {
         fi
         if [[ -n "$broker_fdatasync_stall_ms" ]]; then
             # shellcheck disable=SC2086
-            EMBARCADERO_FDATASYNC_STALL_MS="$broker_fdatasync_stall_ms" $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+            EMBARCADERO_FDATASYNC_STALL_MS="$broker_fdatasync_stall_ms" $EMBARLET_NUMA_BIND ./embarlet "${MEMORY_BACKEND_ARGS[@]}" --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
                 --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
                 > /tmp/broker_"$i".log 2>&1 &
         else
             # shellcheck disable=SC2086
-            $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+            $EMBARLET_NUMA_BIND ./embarlet "${MEMORY_BACKEND_ARGS[@]}" --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
                 --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
                 > /tmp/broker_"$i".log 2>&1 &
         fi
@@ -1951,9 +2013,10 @@ if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
     # whether it actually obtained DAX; POSIX fallback results must be curated
     # as smoke-only, never as CXL mailbox measurements.
     MAILBOX_BACKING="pending_runtime_verification"
+    [[ "$MEMORY_BACKEND" == "emul" ]] && MAILBOX_BACKING="dram_emulation"
 fi
-echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,order5_client_allowlists,publish_client_allowlists,client_load_bytes_pipe,client_target_mbps_pipe,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
-echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-},${CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE:-},${CLIENT_LOAD_BYTES_PIPE:-},${CLIENT_TARGET_MBPS_PIPE:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+echo "memory_backend,sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,order5_client_allowlists,publish_client_allowlists,client_load_bytes_pipe,client_target_mbps_pipe,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$MEMORY_BACKEND,$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-},${CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE:-},${CLIENT_LOAD_BYTES_PIPE:-},${CLIENT_TARGET_MBPS_PIPE:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
 
 if ! lazylog_metadata_endpoints_ready; then
     exit 1

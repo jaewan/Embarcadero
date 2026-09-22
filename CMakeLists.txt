@@ -13,22 +13,13 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # Compiler settings
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "-Wall -O3")
 set(CMAKE_INSTALL_MESSAGE LAZY)
-set(CMAKE_PARALLEL_LEVEL 16)
-
-# performance_utils.h calls _mm_clflushopt on x86.  Check and enable the
-# precise compiler feature rather than assuming -march=native was accepted;
-# the latter can be absent from generated target flags and leaves every CXL
-# translation unit uncompilable.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
-	include(CheckCXXCompilerFlag)
-	check_cxx_compiler_flag("-mclflushopt" COMPILER_SUPPORTS_CLFLUSHOPT)
-	if(NOT COMPILER_SUPPORTS_CLFLUSHOPT)
-		message(FATAL_ERROR "This x86 build requires compiler support for -mclflushopt")
-	endif()
-	add_compile_options("-mclflushopt")
-endif()
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+include(cmake/EmbarcaderoBuildOptions.cmake)
+option(EMBARCADERO_BUILD_BROKER "Build the broker (includes baseline runtime adapters)" ON)
+option(EMBARCADERO_BUILD_BASELINE_TOOLS "Build standalone comparison baseline tools" ON)
+option(EMBARCADERO_CLIENT_BASELINES "Include Corfu RPC support in the client" ON)
+option(EMBARCADERO_BUILD_BENCHMARKS "Build component and KV benchmarks" ON)
 
 include(FetchContent)
 set(ABSL_ENABLE_INSTALL OFF) # Do NOT install Abseil
@@ -43,7 +34,7 @@ set(gRPC_BUILD_TESTS OFF CACHE BOOL "Don't build gRPC tests." FORCE)
 FetchContent_Declare(
   gRPC
   GIT_REPOSITORY https://github.com/grpc/grpc
-  GIT_TAG        v1.55.1
+  GIT_TAG        12161ee3aa7c216741cd7c406573abc0df1d0926 # v1.55.1; immutable revision
 )
 set(FETCHCONTENT_QUIET OFF) # Consider turning this on after initial setup
 FetchContent_MakeAvailable(gRPC)
@@ -58,7 +49,7 @@ find_package(folly REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # Enable CTest (required for add_test() in test/ and E2E scripts)
-enable_testing()
+include(CTest)
 
 # Option to enable latency statistics collection (compile-time removal for performance)
 option(COLLECT_LATENCY_STATS "Enable latency statistics collection (adds overhead)" OFF)
@@ -71,5 +62,18 @@ endif()
 
 # Add subdirectories
 add_subdirectory(src)
-add_subdirectory(benchmarks)   # KV benchmark + component micro-benchmarks
-add_subdirectory(test)
+if(EMBARCADERO_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+if(BUILD_TESTING)
+    add_subdirectory(test)
+endif()
+# Apply project options after target creation; bundled dependencies are excluded.
+embarcadero_apply_options("${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(EMBARCADERO_BUILD_BENCHMARKS)
+    embarcadero_apply_options("${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")
+endif()
+if(BUILD_TESTING)
+    embarcadero_apply_options("${CMAKE_CURRENT_SOURCE_DIR}/test")
+    embarcadero_write_test_inventory()
+endif()

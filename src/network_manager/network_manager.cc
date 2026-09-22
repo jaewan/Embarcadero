@@ -1,3 +1,5 @@
+#include "network_manager/framing.h"
+#include "network_manager/batch_validation.h"
 #include <atomic>
 #include <array>
 #include <stdlib.h>
@@ -38,7 +40,7 @@ namespace Embarcadero {
 constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
 constexpr uint64_t kSessionEntryFlagFenced = 1ULL << 0;
 constexpr uint64_t kSessionEntryFlagActive = 1ULL << 1;
-constexpr uint32_t kSessionControlMagic = 0x53455346U;  // "SESF"
+using network::kSessionControlMagic;
 
 //----------------------------------------------------------------------------
 // Utility Functions
@@ -179,6 +181,7 @@ static bool ScanGOICommittedHwm(
 	for (uint64_t i = limit; i-- > 0;) {
 		GOIEntry* entry = &goi[i];
 		CXL::invalidate_cacheline_for_read(entry);
+        CXL::invalidate_cacheline_for_read(reinterpret_cast<const uint8_t*>(entry) + 64);
 		CXL::load_fence();
 		if (entry->global_seq != i) continue;
 		if (entry->client_id == client_id && entry->session_epoch == session_epoch) {
@@ -224,10 +227,7 @@ static bool SendSessionFencedControl(
 	std::string payload;
 	if (!fenced.SerializeToString(&payload)) return false;
 	const uint32_t len = static_cast<uint32_t>(payload.size());
-	struct Header {
-		uint32_t magic;
-		uint32_t length;
-	} header{kSessionControlMagic, len};
+	network::SessionControlHeader header{kSessionControlMagic, len};
 	if (send(fd, &header, sizeof(header), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(header))) {
 		return false;
 	}
@@ -236,33 +236,21 @@ static bool SendSessionFencedControl(
 }
 
 static bool RecvExactNetwork(int fd, void* data, size_t len) {
-	uint8_t* p = static_cast<uint8_t*>(data);
-	size_t got = 0;
-	while (got < len) {
-		ssize_t n = recv(fd, p + got, len - got, 0);
-		if (n < 0) {
-			if (errno == EINTR) continue;
-			return false;
-		}
-		if (n == 0) return false;
-		got += static_cast<size_t>(n);
-	}
-	return true;
+    return network::ReceiveExact(fd, data, len);
 }
 
 static bool SendExactNetwork(int fd, const void* data, size_t len) {
-	const uint8_t* p = static_cast<const uint8_t*>(data);
-	size_t sent = 0;
-	while (sent < len) {
-		ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
-		if (n < 0) {
-			if (errno == EINTR) continue;
-			return false;
-		}
-		if (n == 0) return false;
-		sent += static_cast<size_t>(n);
-	}
-	return true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t sent = 0;
+    while (sent < len && std::chrono::steady_clock::now() < deadline) {
+        const auto n = send(fd, bytes + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) { sent += static_cast<size_t>(n); continue; }
+        if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) return false;
+        pollfd p{fd, POLLOUT, 0};
+        poll(&p, 1, 10);
+    }
+    return sent == len;
 }
 
 static bool SendSessionOpenAckControl(
@@ -278,41 +266,30 @@ static bool SendSessionOpenAckControl(
 	ack.set_assigned_session_epoch(assigned_session_epoch);
 	std::string payload;
 	if (!ack.SerializeToString(&payload)) return false;
-	struct Header {
-		uint32_t magic;
-		uint32_t length;
-	} header{kSessionControlMagic, static_cast<uint32_t>(payload.size())};
+	network::SessionControlHeader header{kSessionControlMagic, static_cast<uint32_t>(payload.size())};
 	return SendExactNetwork(fd, &header, sizeof(header)) &&
 	       SendExactNetwork(fd, payload.data(), payload.size());
 }
 
-static bool TryReceiveSessionOpen(
+static network::PrefixResult TryReceiveSessionOpen(
 		int fd,
 		const EmbarcaderoReq& handshake,
-		embarcadero::session::SessionOpen* out) {
-	if (out == nullptr) return false;
-	struct Header {
-		uint32_t magic;
-		uint32_t length;
-	} header{};
-	struct timeval tv;
-	tv.tv_sec = 0;
-	tv.tv_usec = 200000;
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	ssize_t peek = recv(fd, &header, sizeof(header), MSG_PEEK);
-	if (peek != static_cast<ssize_t>(sizeof(header)) || header.magic != kSessionControlMagic) {
-		return false;
-	}
+		embarcadero::session::SessionOpen* out,
+        const std::atomic<bool>* stop) {
+	if (out == nullptr) return network::PrefixResult::invalid;
+	network::SessionControlHeader header{};
+    const auto prefix = network::PeekControlPrefix(fd, kSessionControlMagic, std::chrono::seconds(2), stop);
+    if (prefix != network::PrefixResult::control) return prefix;
+    if (!RecvExactNetwork(fd, &header, sizeof(header))) return network::PrefixResult::invalid;
 	if (header.length == 0 || header.length > 64 * 1024) {
-		return false;
+		return network::PrefixResult::invalid;
 	}
-	if (!RecvExactNetwork(fd, &header, sizeof(header))) return false;
 	std::string payload(header.length, '\0');
-	if (!RecvExactNetwork(fd, payload.data(), payload.size())) return false;
-	if (!out->ParseFromString(payload)) return false;
-	if (out->client_id() != handshake.client_id) return false;
-	if (out->topic() != std::string(handshake.topic)) return false;
-	return true;
+	if (!RecvExactNetwork(fd, payload.data(), payload.size())) return network::PrefixResult::invalid;
+	if (!out->ParseFromString(payload)) return network::PrefixResult::invalid;
+	if (out->client_id() != handshake.client_id) return network::PrefixResult::invalid;
+	if (out->topic() != std::string(handshake.topic)) return network::PrefixResult::invalid;
+	return network::PrefixResult::control;
 }
 
 static bool ShouldEnableOrder5Trace() {
@@ -682,7 +659,7 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	// race cannot permanently strand one broker without an ACK channel.
 	const int MAX_RETRIES = 5;
 	bool connected = false;
-	for (int attempt = 1; attempt <= MAX_RETRIES && !connected; ++attempt) {
+	for (int attempt = 1; attempt <= MAX_RETRIES && !connected && !stop_threads_.load(std::memory_order_acquire); ++attempt) {
 		ack_fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (ack_fd < 0 || !ConfigureNonBlockingSocket(ack_fd)) {
 			LOG(ERROR) << "SetupAcknowledgmentSocket: cannot create non-blocking ACK socket for broker "
@@ -716,7 +693,14 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			CleanupSocketAndEpoll(ack_fd, ack_efd);
 			ack_fd = -1;
 			ack_efd = -1;
-			if (attempt < MAX_RETRIES) sleep(1);
+			if (attempt < MAX_RETRIES) {
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+                if (!fault::Pause("ack.connect.wait", {UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                        static_cast<uint64_t>(attempt), port}, &stop_threads_)) break;
+#endif
+                for (int tick = 0; tick < 10 && !stop_threads_.load(std::memory_order_acquire); ++tick)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
 			continue;
 		}
 
@@ -735,7 +719,14 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 
 		// Wait for socket to become writable
 		struct epoll_event events[1];
-		int n = epoll_wait(ack_efd, events, 1, 5000);  // 5-second timeout
+		int n = 0;
+        const auto connect_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!stop_threads_.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < connect_deadline) {
+            n = epoll_wait(ack_efd, events, 1, 100);
+            if (n < 0 && errno == EINTR) continue;
+            if (n != 0) break;
+        }
 
 		if (n > 0 && (events[0].events & EPOLLOUT)) {
 			// Check if the connection was successful
@@ -776,10 +767,23 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			CleanupSocketAndEpoll(ack_fd, ack_efd);
 			ack_fd = -1;
 			ack_efd = -1;
-			if (attempt < MAX_RETRIES) sleep(1);
+			if (attempt < MAX_RETRIES) {
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+                if (!fault::Pause("ack.connect.wait", {UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                        static_cast<uint64_t>(attempt), port}, &stop_threads_)) break;
+#endif
+                for (int tick = 0; tick < 10 && !stop_threads_.load(std::memory_order_acquire); ++tick)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
 		}
 	}
 
+    if (stop_threads_.load(std::memory_order_acquire)) {
+        CleanupSocketAndEpoll(ack_fd, ack_efd);
+        ack_fd = -1;
+        ack_efd = -1;
+        return false;
+    }
 	if (!connected) {
 		LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
 			           << " max retries reached connecting to " << client_ip << ":" << port << ". ACK channel will not work.";
@@ -825,8 +829,21 @@ bool NetworkManager::IsConnectionAlive(int fd, char* buffer) {
 // Constructor/Destructor
 //----------------------------------------------------------------------------
 
+static size_t RequestQueueCapacity() {
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+    if (const char* value = std::getenv("EMBARCADERO_FAULT_QUEUE_CAPACITY")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 1 || parsed > 64)
+            throw std::invalid_argument("fault queue capacity must be in 1..64");
+        return parsed;
+    }
+#endif
+    return 64;
+}
+
 NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
-	: request_queue_(64),
+	: request_queue_(RequestQueueCapacity()),
 	large_msg_queue_(10000),
 	broker_id_(broker_id),
 	num_reqReceive_threads_(num_reqReceive_threads) {
@@ -870,11 +887,9 @@ void NetworkManager::Shutdown() {
 			}
 		}
 	}
-	// Send sentinel values to wake up blocked threads
-	std::optional<struct NetworkRequest> sentinel = std::nullopt;
-	for (int i = 0; i < num_reqReceive_threads_; i++) {
-		request_queue_.blockingWrite(sentinel);
-	}
+    for (const auto& request : request_queue_.close()) {
+        if (request) close(request->client_socket);
+    }
 
 	while (true) {
 		std::vector<std::thread> threads_to_join;
@@ -900,7 +915,7 @@ void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
 
 
 void NetworkManager::EnqueueRequest(struct NetworkRequest request) {
-	request_queue_.blockingWrite(request);
+	if (!request_queue_.push(request)) close(request.client_socket);
 }
 
 //----------------------------------------------------------------------------
@@ -911,7 +926,7 @@ void NetworkManager::MainThread() {
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 
 	// Create server socket
-	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+	int server_socket = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if (server_socket < 0) {
 		LOG(ERROR) << "Socket creation failed: " << strerror(errno);
 		return;
@@ -947,7 +962,9 @@ void NetworkManager::MainThread() {
 				close(server_socket);
 				return;
 			}
-			sleep(5);  // Retry after delay
+            for (int tick = 0; tick < 50 && !stop_threads_; ++tick)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (stop_threads_) { close(server_socket); return; }
 		}
 	}
 
@@ -1023,11 +1040,14 @@ void NetworkManager::MainThread() {
 
 void NetworkManager::ReqReceiveThread() {
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+    if (!fault::Pause("queue.worker_paused", {}, &stop_threads_)) return;
+#endif
 	std::optional<struct NetworkRequest> opt_req;
 
 	while (!stop_threads_) {
 		// Wait for a new request
-		request_queue_.blockingRead(opt_req);
+		if (!request_queue_.pop(opt_req)) break;
 
 		// Check if this is a sentinel value (shutdown signal)
 		if (!opt_req.has_value()) {
@@ -1076,6 +1096,15 @@ void NetworkManager::ReqReceiveThread() {
 				break;  // leave recv loop; outer loop fetches next queued request
 			}
 			read_total += static_cast<size_t>(ret);
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+            if (read_total < sizeof(handshake) &&
+                !fault::Pause("ingress.handshake.partial",
+                    {handshake.client_id, UINT64_MAX, UINT64_MAX, read_total, sizeof(handshake)}, &stop_threads_)) {
+                close(req.client_socket);
+                handshake_failed = true;
+                break;
+            }
+#endif
 		}
 		if (stop_threads_) {
 			if (!handshake_failed) {
@@ -1099,6 +1128,9 @@ void NetworkManager::ReqReceiveThread() {
 			case Subscribe:
 				HandleSubscribeRequest(req.client_socket, handshake);
 				break;
+            default:
+                close(req.client_socket);
+                break;
 		}
 	}
 }
@@ -1123,19 +1155,48 @@ void NetworkManager::HandlePublishRequest(
 		return;
 	}
 
+    Topic* publish_topic = cxl_manager_->GetTopicPtr(handshake.topic);
+    if (!publish_topic) {
+        LOG(WARNING) << "Publish topic is not initialized";
+        close(client_socket);
+        return;
+    }
+
 	// Setup acknowledgment channel if needed
 	int ack_fd = client_socket;
 	uint32_t connection_session_epoch =
 		static_cast<uint32_t>(ReadEnvIntNonNegative("EMBARCADERO_SESSION_EPOCH", 0));
 	embarcadero::session::SessionOpen open;
-	const bool has_session_open = TryReceiveSessionOpen(client_socket, handshake, &open);
+    // Only ORDER5 Embarcadero publishers negotiate sessions. Legacy publishers
+    // wait for the ACK connection before sending their first batch, so peeking
+    // at payload here would make both ends wait for one another during Init().
+    const bool session_mode = publish_topic->GetSeqtype() == EMBARCADERO &&
+        publish_topic->GetOrder() == Embarcadero::kOrderStrong;
+	const auto session_prefix = session_mode
+        ? TryReceiveSessionOpen(client_socket, handshake, &open, &stop_threads_)
+        : network::PrefixResult::legacy;
+    if (session_prefix == network::PrefixResult::invalid) {
+        LOG(WARNING) << "Invalid or incomplete session negotiation";
+        close(client_socket);
+        return;
+    }
+    const bool has_session_open = session_prefix == network::PrefixResult::control;
 	if (has_session_open) {
 		connection_session_epoch = open.requested_session_epoch() != 0
 			? open.requested_session_epoch()
 			: 1U;
+        const auto admission = publish_topic->TryAdmitSession(
+            handshake.client_id, connection_session_epoch);
+        if (admission == Topic::SessionAdmission::unavailable) {
+            SendSessionOpenAckControl(client_socket, 0, false,
+                embarcadero::session::SessionOpenAck::RESOURCE_EXHAUSTED, connection_session_epoch);
+            LOG(WARNING) << "Session OPEN rejected: authoritative state unavailable";
+            close(client_socket);
+            return;
+        }
 		DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
 			cxl_manager_, handshake.topic, handshake.client_id, connection_session_epoch);
-		const auto status = snapshot.fenced
+		const auto status = (admission == Topic::SessionAdmission::fenced || snapshot.fenced)
 			? embarcadero::session::SessionOpenAck::FENCED
 			: embarcadero::session::SessionOpenAck::OK;
 		// Inclusive HWM with empty-prefix disambiguation:
@@ -1271,7 +1332,7 @@ void NetworkManager::HandlePublishRequest(
 					          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id
 					          << ", session_epoch=" << connection_session_epoch;
 					// Pass local_ack_efd to thread so it uses the correct epoll instance.
-					if (!StartManagedThread(&NetworkManager::AckThread, this, handshake.topic,
+					if (!StartManagedThread(&NetworkManager::AckThread, this, std::string(handshake.topic),
 							handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
 							connection_session_epoch)) {
 						LOG(INFO) << "HandlePublishRequest: Shutdown in progress; not starting AckThread for broker "
@@ -1371,8 +1432,9 @@ void NetworkManager::HandlePublishRequest(
 		}
 		batch_header.session_epoch32 = connection_session_epoch;
 
-		if (batch_header.total_size == 0) {
-			LOG(WARNING) << "NetworkManager: Received batch with total_size=0, closing connection.";
+		const size_t max_wire_batch = BATCH_SIZE + std::min(wire::MaxV1PaddedSize(), SEGMENT_SIZE - 64 - BATCH_SIZE);
+        if (!network::ValidBatchEnvelope(batch_header, max_wire_batch, handshake.client_id)) {
+			LOG(WARNING) << "NetworkManager: Invalid batch envelope, closing connection.";
 			running = false;
 			break;
 		}
@@ -1388,16 +1450,13 @@ void NetworkManager::HandlePublishRequest(
 				handshake.client_id,
 				batch_header.batch_seq,
 				connection_session_epoch)) {
-			static thread_local std::vector<uint8_t> discard_buf;
-			if (discard_buf.size() < batch_header.total_size) {
-				discard_buf.resize(batch_header.total_size);
-			}
+			std::array<uint8_t, 64 * 1024> discard_buf;
 			size_t drained = 0;
 			bool drain_ok = true;
 			while (drained < batch_header.total_size && !stop_threads_) {
 				ssize_t n = recv(client_socket,
-						discard_buf.data() + drained,
-						batch_header.total_size - drained,
+						discard_buf.data(),
+                        std::min(batch_header.total_size - drained, discard_buf.size()),
 						recv_flags);
 				if (n < 0) {
 					if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
@@ -1439,6 +1498,7 @@ void NetworkManager::HandlePublishRequest(
 			const auto pbr_admit_deadline =
 				std::chrono::steady_clock::now() + std::chrono::minutes(5);
 			while (topic_ptr->IsPBRAboveHighWatermark(80) && !stop_threads_) {
+                if (topic_ptr->IsBLogCapacityExhausted()) { running = false; break; }
 				if (std::chrono::steady_clock::now() >= pbr_admit_deadline) {
 					LOG(ERROR) << "NetworkManager: PBR admit wait exceeded 5m hard cap; "
 					           << "closing socket for batch_seq=" << batch_header.batch_seq;
@@ -1515,24 +1575,9 @@ void NetworkManager::HandlePublishRequest(
 				}
 
 			if (blog_exhausted_drain) {
-				static thread_local std::vector<uint8_t> exhaust_buf;
-				if (exhaust_buf.size() < batch_header.total_size) {
-					exhaust_buf.resize(batch_header.total_size);
-				}
-				size_t drained = 0;
-				while (drained < batch_header.total_size && !stop_threads_) {
-					ssize_t n = recv(client_socket,
-							exhaust_buf.data() + drained,
-							batch_header.total_size - drained,
-							recv_flags);
-					if (n <= 0) break;
-					drained += static_cast<size_t>(n);
-				}
-				LOG(ERROR) << "NetworkManager: BLog exhausted; drained batch_seq="
-				           << batch_header.batch_seq
-				           << " client_id=" << handshake.client_id
-				           << " without CXL alloc (client may RTO)";
-				continue;
+                LOG(ERROR) << "BLog capacity exhausted; terminating publish connection";
+                running = false;
+                break;
 			}
 
 			if (!buf) {
@@ -1635,6 +1680,14 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
+        const bool body_v2 = seq_type == EMBARCADERO && topic_ptr &&
+            (topic_ptr->GetOrder() == 0 || topic_ptr->GetOrder() == 5) && HeaderUtils::ShouldUseBlogHeader();
+        const void* validated_body = (kNtIngest && !nt_staging.empty()) ? nt_staging.data() : buf;
+        if (!network::ValidateBatchBody(validated_body, batch_header.total_size, batch_header.num_msg, body_v2)) {
+            LOG(WARNING) << "Malformed batch body; rejecting before publication";
+            running = false;
+            break;
+        }
 		if (seq_type == LAZYLOG) {
 			VLOG(1) << "LazyLog ingest payload complete broker=" << broker_id_
 			        << " client=" << handshake.client_id
@@ -1693,6 +1746,7 @@ void NetworkManager::HandlePublishRequest(
 		const auto post_recv_hard_deadline =
 			std::chrono::steady_clock::now() + std::chrono::minutes(5);
 		while (!batch_header_location && !stop_threads_) {
+            if (topic_ptr && topic_ptr->IsBLogCapacityExhausted()) { running = false; break; }
 			if (std::chrono::steady_clock::now() >= post_recv_hard_deadline) {
 				LOG(ERROR) << "NetworkManager: PBR post-recv wait exceeded 5m hard cap for batch_seq="
 				           << batch_header.batch_seq << " client_id=" << handshake.client_id
@@ -1811,19 +1865,6 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	// ORDER=0 and ORDER=5 both use BlogMessageHeader when the feature flag is on.
-	// For the ORDER=0 fast path, this code is only reached when fast-path is disabled
-	// (EMBARCADERO_ORDER0_FAST_PATH=0); in the common case order0_fast already continued.
-	// Read-only field access (tinode->order); CXL writes below are flushed via flush_cacheline.
-	bool is_blog_header_enabled = false;
-	if (seq_type == EMBARCADERO) {
-		if (!tinode)
-			tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
-		// Read-only comparisons (tinode->order); CXL writes flushed via flush_cacheline later.
-		if (tinode && (tinode->order == 0 || tinode->order == 5) && HeaderUtils::ShouldUseBlogHeader())
-			is_blog_header_enabled = true;  // flush_cacheline not needed: no CXL write here
-	}
-
 	// Signal batch completion for ALL order levels
 	// This must be done AFTER all messages in the batch are received and marked complete
 	// CRITICAL: Only mark batch_complete if all data was successfully received
@@ -1848,57 +1889,13 @@ void NetworkManager::HandlePublishRequest(
 					expected, true, std::memory_order_relaxed)) {
 				LOG(INFO) << "NetworkManager: skipping full payload-range flush on cache-coherent CXL mapping";
 			}
-		} else if (!is_blog_header_enabled) {
-			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
-			size_t remaining = batch_header.total_size;
-			for (size_t i = 0; i < batch_header.num_msg; ++i) {
-				if (remaining < sizeof(MessageHeader)) {
-					LOG(WARNING) << "NetworkManager: v1 batch too small for header, remaining=" << remaining;
-					break;
-				}
-				if (first_msg->paddedSize == 0 || first_msg->paddedSize > remaining) {
-					LOG(WARNING) << "NetworkManager: v1 invalid paddedSize=" << first_msg->paddedSize
-					             << " remaining=" << remaining;
-					break;
-				}
-				remaining -= first_msg->paddedSize;
-				first_msg = reinterpret_cast<MessageHeader*>(
-					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
-				);
-			}
-			CXL::store_fence();
-			// NT ingest already drained streaming stores with sfence; a full-range
-			// clflushopt over write-through lines is redundant and saturates CXL.
-			if (!kNtIngest) {
-				CXL::flush_cache_range(buf, batch_header.total_size);
-				CXL::store_fence();
-			}
-		} else {
-			BlogMessageHeader* first_msg = reinterpret_cast<BlogMessageHeader*>(buf);
-			size_t remaining = batch_header.total_size;
-			for (size_t i = 0; i < batch_header.num_msg; ++i) {
-				if (remaining < sizeof(BlogMessageHeader)) {
-					LOG(WARNING) << "NetworkManager: v2 batch too small for header, remaining=" << remaining;
-					break;
-				}
-				const size_t payload_size = static_cast<size_t>(first_msg->size);
-				if (!wire::ValidateV2Payload(payload_size, remaining)) {
-					LOG(WARNING) << "NetworkManager: v2 invalid payload_size=" << payload_size
-					             << " remaining=" << remaining;
-					break;
-				}
-				const size_t stride = wire::ComputeStrideV2(payload_size);
-				remaining -= stride;
-				first_msg = reinterpret_cast<BlogMessageHeader*>(
-					reinterpret_cast<uint8_t*>(first_msg) + stride
-				);
-			}
-			CXL::store_fence();
-			if (!kNtIngest) {
-				CXL::flush_cache_range(buf, batch_header.total_size);
-				CXL::store_fence();
-			}
-		}
+        } else {
+            CXL::store_fence();
+            if (!kNtIngest) {
+                CXL::flush_cache_range(buf, batch_header.total_size);
+                CXL::store_fence();
+            }
+        }
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
 		// [[PERF: Batch flush pattern]] Topic::PublishPBRSlotAfterRecv writes both cachelines, then one fence.
@@ -2006,6 +2003,12 @@ void NetworkManager::HandleSubscribeRequest(
 		const EmbarcaderoReq& handshake) {
 
 	LOG(INFO) << "Broker " << broker_id_ << " received subscribe request for topic=" << handshake.topic;
+    if (!cxl_manager_->GetTopicPtr(handshake.topic)) {
+        LOG(WARNING) << "Subscribe topic is not initialized";
+        close(client_socket);
+        return;
+    }
+
 
 	// Configure socket for optimal throughput
 	if (!ConfigureNonBlockingSocket(client_socket)) {
@@ -2232,6 +2235,12 @@ void NetworkManager::SubscribeNetworkThread(
 					std::this_thread::yield();
 					continue;
 				}
+#if defined(EMBARCADERO_ENABLE_FAULT_INJECTION) && EMBARCADERO_ENABLE_FAULT_INJECTION
+                if (order == 5 && !fault::Pause("export.after_select",
+                        {UINT64_MAX, UINT64_MAX, batch_total_order,
+                         reinterpret_cast<uintptr_t>(msg) - reinterpret_cast<uintptr_t>(cxl_manager_->GetCXLAddr()),
+                         messages_size}, &stop_threads_)) break;
+#endif
 				{
 					absl::MutexLock lock(&cached_state->mu);
 					cached_state->last_offset = local_offset;
@@ -2424,15 +2433,15 @@ bool NetworkManager::SendMessageData(
 
 	size_t sent_bytes = 0;
 
-	while (sent_bytes < buffer_size) {
+	while (sent_bytes < buffer_size && !stop_threads_.load(std::memory_order_acquire)) {
 		// Edge-triggered: send until EAGAIN (or done), then wait once for EPOLLOUT
-		while (sent_bytes < buffer_size) {
+		while (sent_bytes < buffer_size && !stop_threads_.load(std::memory_order_acquire)) {
 			size_t remaining_bytes = buffer_size - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, send_limit);
 			// [[PERF_FIX]] MSG_ZEROCOPY intentionally NOT used: it requires draining
 			// MSG_ERRQUEUE (never implemented), which caused non-deterministic
 			// throughput collapse when the queue filled up.
-			int send_flags = MSG_NOSIGNAL; // prevents SIGPIPE when subscriber closes mid-send (would kill broker process)
+			int send_flags = MSG_NOSIGNAL | MSG_DONTWAIT; // prevents SIGPIPE when subscriber closes mid-send (would kill broker process)
 			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
 
 			if (ret > 0) {
@@ -2455,7 +2464,7 @@ bool NetworkManager::SendMessageData(
 		struct epoll_event events[10];
 		const int64_t epoll_t0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count();
-		int n = epoll_wait(epoll_fd, events, 10, -1);
+		int n = epoll_wait(epoll_fd, events, 10, 100);
 		tl_send_epoll_ns += static_cast<uint64_t>(
 			std::chrono::duration_cast<std::chrono::nanoseconds>(
 				std::chrono::steady_clock::now().time_since_epoch()).count() - epoll_t0);
@@ -2471,7 +2480,7 @@ bool NetworkManager::SendMessageData(
 		}
 	}
 
-	return true;  // All data sent successfully
+	return sent_bytes == buffer_size;
 }
 
 //----------------------------------------------------------------------------
@@ -2844,7 +2853,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 }
 
 void NetworkManager::AckThread(
-		const char* topic_cstr,
+		std::string topic,
 		uint32_t ack_level,
 		int ack_fd,
 		int ack_efd,
@@ -2854,7 +2863,7 @@ void NetworkManager::AckThread(
 	char buf[1];
 
 	// Create std::string for internal use (required by GetOffsetToAck interface)
-	std::string topic(topic_cstr ? topic_cstr : "");
+
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
 	          << "' (len=" << topic.size() << "), ack_level=" << ack_level

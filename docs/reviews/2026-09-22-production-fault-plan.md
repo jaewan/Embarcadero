@@ -1,0 +1,161 @@
+# Next gate: production-path fault tests
+
+Status: **the proposed fault cases below have not been implemented or run**. The startup-address follow-up also records an implemented runner correction. This plan follows the [initial refactoring implementation](2026-09-22-refactoring-implementation.md). It does not change the frozen performance binaries, harness, or measurement protocol. Source references describe the working tree reviewed on 2026-09-22; resolve the named function again when implementing, since line numbers will move.
+
+The lead and an independent reviewer cross-checked this specification against the source. Review separated the live sequencer's serialized classification/commit schedule from synthetic gate-concurrency stress, and distinguished PBR retirement from stalled GOI readers. This review qualifies the proposed experiment design, not the unexecuted fault behavior.
+
+The next gate is evidence that the real Topic, NetworkManager, publisher, and shutdown paths preserve their contracts under deliberately controlled interleavings. Existing component tests are useful foundations, but a passing model or extracted helper is insufficient for this gate. Results will establish bounded behavior on coherent DRAM; they will not establish non-coherent CXL visibility, persistent-media durability, host failover, physical writer fencing, or sustainable reclamation.
+
+## What the oracle must observe
+
+- Identify each application message by `(client_id, session_epoch, batch_seq, message_index)` plus an indexed payload and checksum. Keep an external expected-delivery ledger. For reopen/resubmit, retain an application identity across epochs so the oracle can detect duplicate application delivery.
+- Observe GOI reservation, initialized GOI entries, session publication, per-client ordered count, published `committed_seq`, and ACK reception separately. They are different publication stages, not one atomic snapshot. Compare exact values at controlled barriers or after quiescence; do not fail a legal intermediate state merely because two frontiers differ.
+- In ORDER5, the completion oracle is the publisher's authoritative `order5_last_ack_hwm_`, read by [`Publisher::Poll`](../../src/client/publisher.cc#L2769). [`EpollAckThread`](../../src/client/publisher.cc#L3667) publishes that HWM before `CompleteUnackedThrough` and the raw `ack_received_` increment. A contemporaneous raw ACK count or `[UNACKED_DRAIN]` snapshot may lag. Record both as diagnostics. Require an empty unacked ledger only after a separate barrier confirms the ACK handler finished retirement.
+- Broker ACK1 uses the per-client ordered frontier in [`NetworkManager::AckThread`](../../src/network_manager/network_manager.cc#L3081). Counts attributed to individual ACK sockets need not equal messages sent through those brokers. For multiple publishers, check that one publisher's progress cannot acknowledge another's messages.
+- Delivery must contain exactly the expected committed application identities and payload bytes, in the promised per-session/global order. When the test intentionally ends an incomplete stream, require the exact valid prefix and an explicit incomplete/closed outcome; do not reuse the normal smoke check's full-workload-success predicate.
+- A rejected or fenced attempt must not create a new GOI entry, advance the corresponding ordered/ACK count, or appear at the subscriber. Payload reservation and publication are separate: a truncated receive may consume finite BLog space without committing anything.
+
+The ORDER5 read path is [`Topic::GetBatchToExportWithMetadata`](../../src/embarlet/topic.cc#L3283): it scans the append-only GOI, gates on `committed_seq` and the entry readiness identity, and reads payload by `blog_offset`. A paused ORDER5 subscriber is therefore **not an export-ring-lap test**. PBR wrap and stalled GOI readers must be tested separately. [`CommittedSeqUpdaterThread`](../../src/embarlet/topic.cc#L3858) advances the contiguous GOI frontier asynchronously after completed ranges are enqueued.
+
+## Harness and injection contract
+
+Implement a separate optional integration driver under `test/integration/`, reusing owned-process, fixed-port-lock, effective-config, NUMA-preflight, and cleanup primitives from [`tools/dev_cluster.py`](../../tools/dev_cluster.py). Keep ordinary smoke and performance execution unchanged. A small C++ protocol driver should use the repository's actual wire structures/protobufs; do not duplicate their ABI in Python.
+
+The first implementation must provide a test-only controller with these properties:
+
+1. Each hook has an explicit name, run token, broker/client/session/batch selector, and one-shot hit count. An inherited local control FD supplies arm/release/cancel commands and emits bounded structured events. Default production builds have no enabled fault hooks. Any compiled fast-path checks require a separate cost review before entering performance builds.
+2. A barrier reports `reached` before the controller acts. A timeout means failure to exercise the schedule, never a pass. Avoid sleep-based ordering. Hook cancellation observes shutdown and controller disconnect, including while the target holds the publication gate; cleanup must not depend on the paused data path.
+3. Snapshots are captured at the production transition or under its existing synchronization. A monitor must not dereference mutable Topic containers concurrently or forge GOI/session/CV state to manufacture the desired outcome.
+4. Hooks do not bypass the behavior under test. For example, drive a gap through normal classification/expiry rather than directly calling the `record_fence` lambda, and send real socket bytes to exercise ingress validation. A test clock may advance only the selected session's expiry evaluation, with the injected value recorded.
+5. Every fixture records the exact hook build, effective limits, and hook hit/release timeline. The same binaries with hooks unarmed must pass a small success control before fault cases begin. No injected run is a throughput baseline.
+
+Proposed hook inventory:
+
+| Hook | Production location | Purpose |
+|---|---|---|
+| `commit.before_gate`, `commit.after_gate` | [`Topic::CommitEpoch`](../../src/embarlet/topic.cc#L4978), around the gate at 4988 | Observe live publication; force concurrent gate winners only in the explicitly identified linked-Topic stress fixture |
+| `classification.before_expiry_sweep` | [`ProcessLevel5BatchesShard`](../../src/embarlet/topic.cc#L7385), after collecting ready work and before expiry decisions | Exercise a reachable fence-before-commit schedule in the same classification pass |
+| `commit.before_session_publish`, `commit.before_completed_range` | Same function, session publication at 5536 and completed-range enqueue after 5605 | Separate initialized data, session publication, ACK source, and reader visibility |
+| `fence.before_gate`, `fence.after_publish` | [`ProcessLevel5BatchesShard::record_fence`](../../src/embarlet/topic.cc#L6798), publication at 6830 | Observe the exact committed prefix and sticky fenced state |
+| `ingress.after_blog_reserve`, `ingress.before_pbr_publish` | [`HandlePublishRequest`](../../src/network_manager/network_manager.cc#L1528), receive completion/validation at 1644–1667 and publication at 1846 | Delay an old-segment writer or stop immediately before visibility |
+| `rollover.before_new_segment`, `export.before_payload_send` | [`CheckSegmentBoundary`](../../src/embarlet/topic.cc#L1545) and its caller in the real subscriber path | Force allocation failure or retain a live reader's old payload reference |
+| `ack.after_authoritative_hwm`, `ack.after_retirement` | [`Publisher::EpollAckThread`](../../src/client/publisher.cc#L3667), before/after `CompleteUnackedThrough` at 3688 | Reproduce legitimate diagnostic lag and verify eventual retirement |
+| `queue.worker_paused`, `chain.before_token_publish` | [`ReqReceiveThread`](../../src/network_manager/network_manager.cc#L1028), [`ChainReplicationManager::ReplicationThread`](../../src/disk_manager/chain_replication.cc#L591) | Force queue cancellation and a missing predecessor deterministically |
+
+These are proposed hooks, not existing interfaces. The existing one-shot `EMBARCADERO_TEST_ORDER5_STUCK_CLAIMED_*` selectors in [`ShouldLeaveOrder5ClaimedForTest`](../../src/network_manager/network_manager.cc#L358) can create a real claimed-but-unpublished slot at line 1799. They do not provide the commit/fence barriers above. Reuse their exact client/epoch/batch selectors only in an owned runner; do not invoke historical launchers with broad cleanup behavior. The existing replication sync sleep is not a substitute for a cancellable barrier.
+
+## Bounded first implementation tranche
+
+Implement T1–T4 in this order. The initial acceptance matrix is twelve fresh-region runs: one unarmed success control; five T1 variants; three T2 shutdown variants; the two reachable T3 schedules below; and one T4 ACK-publication variant. Use one broker, one topic, ORDER5/ACK1/RF0 unless specified. Keep each run under four minutes including startup and cleanup, so this initial matrix has a 48-minute hard ceiling. Synthetic concurrent gate stress is separate and excluded from this count. This is a proposed campaign budget, not an execution request during the current performance pilot.
+
+### T1 — Incomplete and invalid ingress never becomes published work
+
+Paths: [`TryReceiveSessionOpen`](../../src/network_manager/network_manager.cc#L280), [`PeekControlPrefix` / `ReceiveExact`](../../src/network_manager/framing.h#L16), [`HandlePublishRequest`](../../src/network_manager/network_manager.cc#L1117), envelope validation at 1411, incomplete-payload rejection at 1650, body validation at 1661, and PBR publication at 1846.
+
+Five variants:
+
+1. Fragment a valid four-byte control prefix across writes and complete a valid OPEN; follow with one valid indexed batch. It must negotiate as control, not legacy, and complete exactly once.
+2. Send a partial control prefix and keep the socket open past the existing two-second prefix deadline. It must close without starting a publisher session/ACK stream or allocating payload. Separately enumerate truncated protobuf/header boundaries in the protocol driver's fast socket tests before running the cluster variant.
+3. Send a complete batch envelope with client identity different from the connection handshake. It must be rejected before allocation or duplicate draining. Add zero count, oversized length and overflow boundaries to the same protocol-driver test table.
+4. After a valid OPEN/envelope, send only part of the payload and close the write side. A BLog reservation may remain consumed, but no PBR publication, GOI/session progress, ACK for that batch, or delivery is allowed.
+5. Send a complete payload with an invalid message stride/count boundary. Rejection must precede PBR publication. This also exercises the body parser after all socket bytes were received.
+
+For rejection variants, first commit a two-batch prefix and snapshot it at quiescence, then inject the invalid attempt. Require unchanged committed prefix and successful delivery of a valid batch on a new session afterward, while storage remains available. Use a different session for the recovery control so an intentionally missing batch does not turn this transport test into a gap-expiry test. Record FD counts before/after completed connections and actual close events; allow bounded framework background FDs, with an explicit inventory rather than a process-wide exact number.
+
+### T2 — Shutdown interrupts owned blocked work
+
+Paths: [`NetworkManager::Shutdown`](../../src/network_manager/network_manager.cc#L859), queue close at 877, [`ReqReceiveThread`](../../src/network_manager/network_manager.cc#L1028), [`SetupAcknowledgmentSocket`](../../src/network_manager/network_manager.cc#L642), and broker shutdown order in [`main`](../../src/embarlet/embarlet.cc#L494), followed by [`TopicManager::Shutdown`](../../src/embarlet/topic_manager.cc#L34).
+
+Three initial variants: a partial ordinary handshake whose peer remains connected; a complete publish handshake whose ACK endpoint never accepts; and a full request queue with one producer waiting to enqueue. Use a test queue capacity of two and bounded worker admission for the last case, not thousands of host sockets. After a marker proves the intended blocked state, signal SIGTERM to the owned broker process group.
+
+Invariant: the stop signal closes/wakes the relevant queue/socket wait, every owned worker exits, queued socket ownership is released exactly once, and shutdown does not fabricate PBR/GOI/session/ACK progress. No fatal exit or SIGKILL is accepted for a passing shutdown case. Set a 15-second target from SIGTERM to process exit; the controller may use its 30-second cleanup deadline to collect diagnostics and kill its own group after a failure.
+
+Then add partial session-control payload, partial batch receive, and the post-receive PBR-full wait as expansion cases. The network code intentionally loops on receive timeout while running; a receive timeout alone is not an admission deadline. The test must issue shutdown and verify cancellation rather than assume slow peers disconnect automatically.
+
+### T3 — Classification, commit and fence use the committed prefix
+
+Paths: [`CommitEpoch`](../../src/embarlet/topic.cc#L4978), authoritative spatial guard at 5010, joint reservation at 5103, session publication at 5536; [`ProcessLevel5BatchesShard::record_fence`](../../src/embarlet/topic.cc#L6798), expiry decision at 7430; OPEN reply at [`HandlePublishRequest`](../../src/network_manager/network_manager.cc#L1163); fence delivery in [`AckThread`](../../src/network_manager/network_manager.cc#L3037).
+
+The current live scheduler serializes these stages: [`EpochSequencerThread`](../../src/embarlet/topic.cc#L6131) calls `ProcessLevel5Batches`, which waits for each shard to finish at line 6715, and only then calls `CommitEpoch` at line 6181. Idle and drain paths follow the same order. Pausing commit and waiting for that same sequencer to run another expiry pass would deadlock the test. Do not describe the following live cases as a demonstrated concurrent commit/fence race.
+
+Create a known committed prefix and use these reachable schedules:
+
+- **Expiry before publication in one classification pass:** collect a ready-but-uncommitted batch, leave the following sequence absent and a later batch held, then pause immediately before the normal expiry sweep. Advance the selected gap's test clock past its lease and resume classification. After observing the real fence publication, allow normal `CommitEpoch` to process the previously ready batch. Its authoritative guard must reject the batch even if this is the first rejection in the process. Its identity must never appear in GOI, ordered counts, delivery, or ACK progress. The test must prove that both a ready item and the selected expired gap existed in that pass; otherwise the intended case was not exercised.
+- **Publication before a later expiry:** commit and observe a new batch through the normal epoch path, then submit a later batch beyond a missing sequence and expire that gap in a subsequent classification pass. Fence publication must report the prefix actually published by the earlier commit, excluding the later held batch and any speculative classifier cursor. Both worker completion and subsequent shard retirement must remain live.
+
+Capture the wire `SessionFenced` and a subsequent real OPEN for the old epoch. The old epoch must stay fenced, and its reply must describe an actually committed prefix. Duplicate old-epoch data must not advance publication. The default production client may automatically reopen; initially use the controlled protocol driver to observe fencing without that additional behavior. Add the production publisher's reopen/resubmit path in [`HandleSessionFenced`](../../src/client/publisher.cc#L1312) only after these two schedules pass, then require exact application delivery without duplication across epochs.
+
+The first twelve-run matrix includes these two schedules with a nonempty prefix. Empty-prefix, reopen/resubmit, and three-broker schedules are required follow-ups before claiming session-failure qualification. The empty-prefix representation must be `has_committed_prefix=false`, not an ambiguous inclusive HWM of zero. For OPEN concurrently observing in-progress publication, record the response and prove its reported prefix has initialized GOI payload and valid session identity; do not assume all fields are read atomically by [`ReadDurableSessionSnapshot`](../../src/network_manager/network_manager.cc#L195).
+
+Separately build a linked-Topic stress fixture that deliberately schedules real commit and fence publication concurrently under test control. Exercise both publication-gate winners and verify that the gate is released before shard retirement at line 5605. Explicitly label this as a stronger synthetic schedule over production methods. It is not evidence that the current live scheduler permits those overlapping calls. Do not add a second production sequencer or directly mutate authoritative entries merely to create the race.
+
+### T4 — Authoritative ACK publication and eventual retirement
+
+Pause the real client's ACK handler immediately after the HWM CAS and before `CompleteUnackedThrough`. Let `Poll` observe its full target while the raw counter and unacked ledger still lag. The success predicate must accept exact authoritative completion plus the exact delivery audit, not invent a raw-counter requirement. Release the handler and wait for `ack.after_retirement`; then require all acknowledged buffers/ledger entries to be released and no repeated application delivery.
+
+Use one indexed batch for the first case. Expansion cases deliver duplicate cumulative ACK values through a second broker socket and fence/reopen with an ACK generation change. The HWM must remain monotonic and advance once per newly acknowledged range. A negative control withholding the final authoritative advancement must fail completion despite any diagnostic counter values. These cases exercise [`EpollAckThread`](../../src/client/publisher.cc#L3272) and [`Poll`](../../src/client/publisher.cc#L2545), not a replacement ACK model.
+
+## Second tranche: storage lifetime, capacity and replication
+
+### T5 — Old reservations and stalled readers survive rollover
+
+Paths: [`TryReserveBLogSpaceFailClosed`](../../src/embarlet/topic.cc#L2727), [`CheckSegmentBoundary`](../../src/embarlet/topic.cc#L1545), [`SegmentForAddress`](../../src/embarlet/topic.cc#L1537), production [`TryRolloverSegment`](../../src/embarlet/bounded_reservation.h#L111), [`CXLManager::GetNewSegment`](../../src/cxl_manager/cxl_manager.cc#L789), and GOI export at [`GetBatchToExportWithMetadata`](../../src/embarlet/topic.cc#L3283).
+
+Pause producer A after it reserves the tail of segment S and before it finishes receiving. Producer B fills the remaining space and obtains S+1 through the actual allocator. Resume A: its bytes and header must still identify S, reservations must not overlap, and both batches must deliver with intact indexed payloads. Check segment bounds/canaries without putting canaries inside legitimate metadata or payload.
+
+Independently pause a subscriber after selecting an old GOI payload and before sending/consuming it. Continue publishing through at least two segment transitions and several PBR laps, then resume. All earlier GOI payloads must remain unchanged and deliver exactly once. There is no reclaim/reuse permission from the segment's reservation high-water mark; `retired_segments_` retains old segments. No expectation of indefinite retention beyond finite available capacity is implied.
+
+Use the existing validated `storage.batch_headers_size` setting to make a small PBR (for example 64 slots), with identical region geometry on all brokers. Verify slot identity, logical message offset and absolute PBR index from the same production reservation at [`ReservePBRSlotCore`](../../src/embarlet/topic.cc#L2914); delayed observations across wrap must not manufacture free capacity. A paused subscriber does not itself prevent PBR retirement in the GOI export design: explicitly pause the sequencer/retirement stage for the PBR-full variant.
+
+Target 640 MiB total application payload, with hard caps of 768 MiB and three allocated 256 MiB payload segments for the first rollover case. Compute wire bytes and initial/header offsets when selecting the exact crossing points and obey the smaller resulting limit; do not assume application bytes equal BLog consumption. Start with two producer connections and one subscriber on one broker.
+
+### T6 — Capacity failure leaves a readable prefix and stops admission
+
+Three distinct failures need production-path evidence:
+
+| Failure | Required seam and schedule | Expected observable result |
+|---|---|---|
+| BLog allocation | One-shot null return at the real new-segment callback after a fixed number of successful allocations; then a separate allocator fixture exhausts an actually bounded bitmap through `ClaimSegment` | Rollover restores the previous cursor on failure; no out-of-range pointer or segment reuse; network closes the affected publisher at [`HandlePublishRequest:1537`](../../src/network_manager/network_manager.cc#L1537); later admission cannot burn more payload or acknowledge rejected work; old committed GOI payload stays readable |
+| GOI/message-order range | Supply a test-only logical GOI budget (e.g. four entries) to the actual [`TryReserveCommitRanges`](../../src/embarlet/topic.cc#L5103) call; issue an epoch crossing the limit | Both sequence reservations stay unchanged for the failed epoch; no partial publication/ACK; [`StopForCapacityExhaustion`](../../src/embarlet/topic.cc#L4964) wakes shard workers and prevents later ingest/commit; a previously committed prefix remains readable |
+| Session admission | Bound the actual shared table view in a linked production fixture (e.g. eight entries), then race repeated keys and one extra distinct key through OPEN | A key has one authoritative entry, repeat admission returns that identity, and the extra key receives `RESOURCE_EXHAUSTED` before payload allocation; no unbounded local fallback; previously admitted sessions retain their prefix |
+
+The new capacity seams are **not implemented**. Keep the real 64 GiB physical layout and GOI allocation. A logical budget must be immutable for the fixture. A shortened session-table view requires every reader, writer, hash modulus, recovery scan and OPEN snapshot reader to use the same view; changing only `FindOrClaimSession` would test a different and invalid lookup protocol. If that is too invasive for the first capacity patch, first inject an explicit admission failure at `FindOrCreateSessionEntry` and label the result as caller-error-path coverage, not proof of real-table exhaustion.
+
+Also force admission failure in the fence path and commit pre-admission path. Require bounded worker termination for both one and multiple classification shards, and never invoke capacity-stop while retaining the publication gate. Do not inject an impossible late `PublishSessionEntry` failure and then describe it as an ordinary all-or-nothing commit: this implementation does not promise a crash-atomic transaction across all publication stages.
+
+### T7 — Missing predecessor and interrupted replication shutdown
+
+Paths: [`ChainReplicationManager::Stop`](../../src/disk_manager/chain_replication.cc#L285), token wait/cancellation at 624, token CAS at 675, worker cancellation/join at 930, and [`UpdateCompletionVector`](../../src/disk_manager/chain_replication.cc#L955).
+
+After T1–T6 pass, run three brokers with explicitly recorded RF/ACK/sink settings. In a memory-copy sink case, pause the predecessor before its real token publication after sink completion, and observe the successor waiting for that exact GOI identity. Stop the successor, then release/stop the remaining owned processes. The successor must exit without advancing `num_replicated` or the completed CV/ACK2 frontier on behalf of the missing predecessor. Record ordering progress separately from replication completion.
+
+Use 32 MiB payload and a single targeted GOI entry; memory-copy completion is not media durability. A later disk-sink case needs a separately owned output directory and injection around short writes/sync failure, preserving the rule that failed or cancelled writes never publish durability. Blocking kernel disk I/O is outside the current bounded-cancellation guarantee and must be reported as such; do not promise a 15-second disk-shutdown bound from the memory test.
+
+[`test/chain_shutdown_test.cc`](../../test/chain_shutdown_test.cc) already invokes the real replication manager with synthetic metadata and an accounting sink. It does not cover the proposed live ingress-to-GOI-to-replication shutdown schedule. Likewise, [`test/session_admission_test.cc`](../../test/session_admission_test.cc), [`test/bounded_reservation_test.cc`](../../test/bounded_reservation_test.cc), and [`test/network_safety_test.cc`](../../test/network_safety_test.cc) cover production primitives but do not replace the new integrated cases.
+
+## Separate release gate: startup address agreement
+
+The retained three-broker v2 failure supplies concrete evidence: [`broker-0.numa_maps`](../../results/refactor-perf/2026-09-22/n3-v2/runs/embarcadero-perf-1002-qydz0qfn/broker-0.numa_maps) places the head's PIE executable at `0x600c73ebf000`, inside the preferred 64 GiB interval `[0x600000000000, 0x601000000000)`. The head mapped shared memory at `0x500000000000`; the follower independently selected `0x600000000000` and failed descriptor validation. [`allocate_shm`](../../src/cxl_manager/cxl_manager.cc#L186) tries the same address list independently in each process. The descriptor's [`mapping_base` check](../../src/cxl_manager/region_layout.h#L50) correctly prevented attachment with incompatible shared pointers.
+
+**Implemented local-runner correction:** owned DRAM runs now set `EMBARCADERO_CXL_BASE_ADDR=0x400000000000` for every broker. Performance protocol v3 checks each broker's mapping log and observed owned-region base before client startup. Both frozen broker binaries already support this override. This contains the failure in the local profile; the generic independent-fallback policy remains a **release blocker**, and coordinated automatic selection is not implemented.
+
+Add two deterministic production-allocator/attachment cases, separate from the twelve-run tranche:
+
+| Case | Injection | Required outcome |
+|---|---|---|
+| First automatic choice occupied in one process | Before `allocate_shm`, reserve a sentinel page inside the first candidate interval in the head only; repeat with the follower only. Use a test-owned `MAP_FIXED_NOREPLACE` reservation and a reached marker, not random ASLR retries. | Every successful attachment uses the head's agreed base. If agreement is impossible, initialization rejects the attachment with the attempted/required base and reason before interpreting dependent shared metadata or publishing readiness. Independently succeeding at different bases must never form a usable cluster. |
+| Required base occupied | Set the explicit common base, reserve a sentinel page inside that interval in the selected process, and attempt mapping; test head and follower rejection separately. | No fallback to another address; actionable bounded initialization failure; no metadata writes by the rejected process, no false readiness, and sentinel contents/protection unchanged. The existing head and its initialized region must remain intact when only a follower fails. |
+
+Capture before/after mapping inventories, sentinel checks, attempted bases/errno, descriptor base, readiness events and owned cleanup. A compatibility case must also cover builds/platforms without `MAP_FIXED_NOREPLACE`: the current [`#else` branch uses `MAP_FIXED`](../../src/cxl_manager/cxl_manager.cc#L214), which can replace an occupied mapping. Clobbering an existing mapping is never an acceptable fallback; the eventual implementation must preserve existing mappings and either establish the exact required address safely or reject it. These tests and runtime-policy changes remain proposed. Use the owned resource/deadline limits below after the frozen pilot finishes; do not alter ASLR globally or count this gate among T1–T4's twelve runs.
+
+## Owned DRAM execution limits and retained evidence
+
+- Acquire the same per-user fixed-port lock as the developer/performance runners; refuse to run while another cluster owns it. Do not run alongside the current pilot, on SSH clients, or with broad process-name cleanup.
+- Allocate one fresh, unique `EMBARCADERO_CXL_SHM_NAME` per case and pass `--emul` to every broker. Use `cxl.size=64 GiB`, not `cxl.emulation_size`. GOI alone reserves 32 GiB, so a 4–32 GiB mapping is invalid. Obtain geometry from the tested broker's `--print-layout` before launch and preserve region-descriptor agreement across brokers.
+- Cap a case at one 64 GiB shared mapping, one topic, three brokers, eight data/control connections, and 768 MiB application payload. T1–T4 normally need at most 32 MiB and one broker. Queue tests use a deliberately small queue, not an unbounded connection flood. Preflight at least region size plus 8 GiB of `/dev/shm` headroom, node-1 free memory for the region plus broker headroom, and 6 GiB of node-0 client headroom. Bound logs/artifacts and abort rather than fill the filesystem.
+- Discover available physical cores and allowed affinities. Pin broker CPUs and memory to NUMA1, protocol/audit clients to NUMA0; node2 is absent. Record the exact disjoint CPU sets. Record observed startup thread masks, memory policies and resident pages; a startup client sample does not directly prove placement of later workload allocations. Make no real-CXL or remote-client performance claim.
+- Bound startup at 120 seconds, the active fault phase at 60 seconds, and cleanup at 30 seconds, within the four-minute whole-case cap. Each armed barrier gets a ten-second reach/release deadline except a specifically recorded lease-expiry case. Do not change the kernel, governor, THP, routing, or existing shared-memory objects to make a case pass.
+- Record PID/start identity and process group for each owned child. On every exit path, release/cancel hooks, signal only owned groups, wait, and escalate only those groups after the deadline. An unexpected exit, forced kill, absent target marker, leaked FD/process, or unremoved owned region fails the case. Unlink shared memory only after matching its recorded inode/ownership. Expected connection rejection is distinct from a broker crash.
+- Preserve source/build/binary/config hashes, layout, backend, fault selectors, monotonic event order, payload/GOI/session/ACK snapshots, observed placement, child exit status, and cleanup outcome. Keep failed attempts with their original verdict. A rerun gets a new run ID and region; do not silently retry until green.
+
+Each implementation patch should add the smallest required hook and one bounded case, followed by cross-review of the hook's lock placement and the independent oracle. Release gating should name exactly which schedules and modes passed. The first tranche qualifies only its twelve specified runs; it does not close the remaining session, rollover, exhaustion, replication, real-CXL, or crash-recovery gates.

@@ -19,6 +19,7 @@
 #include "common/performance_utils.h"
 #include "common/fine_grained_lock.h"
 #include "topic.h"
+#include "single_topic_admission.h"
 #include "cxl_manager/cxl_manager.h"
 #include "disk_manager/disk_manager.h"
 
@@ -34,9 +35,11 @@ class DiskManager;
 //class Topic;
 
 /**
- * Class for managing multiple topics
+ * Topic registration and lifecycle; the shared region currently admits one identity.
  */
 class TopicManager {
+    // One identity for the lifetime of this shared-region attachment.
+    SingleTopicAdmission topic_admission_;
 	public:
 		/**
 		 * Constructor
@@ -178,6 +181,11 @@ class TopicManager {
 			get_num_brokers_callback_ = callback;
 		}
 
+        void RegisterGetLiveBrokerIdsCallback(std::function<std::vector<int>()> callback) {
+            std::lock_guard<std::mutex> lock(membership_callback_mutex_);
+            get_live_broker_ids_callback_ = std::move(callback);
+        }
+
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
@@ -256,6 +264,10 @@ class TopicManager {
 		size_t num_topics_;
 		GetNumBrokersCallback get_num_brokers_callback_;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
+        bool ValidateTopicAdmission(int order, int rf, int ack, heartbeat_system::SequencerType sequencer, int* live_count = nullptr);
+        std::mutex membership_callback_mutex_;
+        std::function<std::vector<int>()> get_live_broker_ids_callback_;
+
 		std::atomic<bool> shutting_down_{false};
 		std::atomic<bool> shutdown_done_{false};
 		std::thread topic_discovery_thread_;

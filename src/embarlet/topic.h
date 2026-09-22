@@ -22,6 +22,8 @@
 #include "common/durable_frontier.h"
 #include "common/wire_formats.h"
 #include "sequencer_utils.h"
+#include "bounded_reservation.h"
+#include "session_admission.h"
 
 #include <tuple>
 #include "absl/container/flat_hash_set.h"
@@ -268,11 +270,6 @@ struct alignas(64) EpochBuffer5 {
  * Atomically allocates (slot_seq, logical_offset) to avoid ordering violations.
  * @paper_ref docs/LOCKFREE_PBR_DESIGN.md §4.1
  */
-struct alignas(16) PBRProducerState {
-	uint64_t next_slot_seq;   // Monotonic slot sequence (not byte offset)
-	uint64_t logical_offset; // Cumulative message count
-};
-static_assert(sizeof(PBRProducerState) == 16, "Must be 16 bytes for CMPXCHG16B");
 
 /**
  * Callback type for obtaining a new segment
@@ -313,7 +310,7 @@ class Topic {
 		void Start();
 		void DumpOrder5FlightRecorder(const char* reason);
 
-		/** Wire CXL FreeSegment so retired segments can be returned after rollover. */
+		/** Retained for API compatibility; reclamation is disabled until ownership is proven. */
 		void SetFreeSegmentCallback(FreeSegmentCallback cb) {
 			free_segment_callback_ = std::move(cb);
 		}
@@ -467,6 +464,9 @@ class Topic {
 			uint64_t* producing_epoch_out = nullptr,
 			uint64_t* control_epoch_out = nullptr) const;
 
+        enum class SessionAdmission { admitted, fenced, unavailable };
+        SessionAdmission TryAdmitSession(uint32_t client_id, uint32_t epoch);
+
 		struct SessionFenceNotification {
 			uint32_t client_id{0};
 			uint32_t session_epoch{0};
@@ -538,9 +538,10 @@ class Topic {
 		uint64_t GetStalePBRPublishRejects() const {
 			return stale_pbr_publish_rejects_.load(std::memory_order_relaxed);
 		}
-		/** True after a failed segment rollover until FreeSegment/GC restores capacity. */
+		/** True when bounded payload or GOI capacity is exhausted; no unsafe reuse. */
 		bool IsBLogCapacityExhausted() const {
-			return blog_capacity_exhausted_.load(std::memory_order_acquire);
+			return blog_capacity_exhausted_.load(std::memory_order_acquire) ||
+			       order5_capacity_exhausted_.load(std::memory_order_acquire);
 		}
 		/**
 		 * @brief Reserves one PBR slot and writes BatchHeader to CXL; caller then writes payload and flushes.
@@ -576,7 +577,7 @@ class Topic {
 					BatchHeader* batch_header_location);
 			bool PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* batch_header_location);
 			/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
-			bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset);
+			bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset, uint64_t& out_absolute);
 		/** [[P2.3]] Shared core: epoch check, slot allocation, CheckSegmentBoundary, segment_header, batch_header metadata. Caller writes slot (minimal or full). */
 		bool ReservePBRSlotCore(BatchHeader& batch_header, void* log, bool epoch_already_checked,
 				void*& batch_headers_log, size_t& logical_offset, void*& segment_header);
@@ -623,7 +624,7 @@ class Topic {
 		SessionEntry* FindSessionEntry(uint64_t session_key);
 		SessionEntry* FindOrCreateSessionEntry(uint64_t session_key);
 		void ReconstructClientStateFromSessionEntry(uint64_t session_key, ClientState5& state);
-		void PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot);
+		bool PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot);
 		void EnqueueCompletedRange(uint64_t start, uint64_t end);
 		void CommittedSeqUpdaterThread();
 		void ResetCompletedRangeQueue();
@@ -649,8 +650,8 @@ class Topic {
 
 		/**
 		 * Check and handle segment boundary crossing.
-		 * @return true if [log, log+msgSize) fits in a live segment (possibly after rollover);
-		 *         false if CXL segments are exhausted — caller must fail closed (no past-end write).
+		 * @return true if the current cursor has room after an optional rollover.
+		 * Caller must retry reservation; this never repairs an existing pointer.
 		 */
 		bool CheckSegmentBoundary(void* log, size_t msgSize, unsigned long long int segment_metadata);
 		/**
@@ -771,6 +772,8 @@ class Topic {
 		/** Raw CXL base (ControlBlock at offset 0). Same as CXLManager::GetCXLAddr(); Topic receives this from TopicManager. */
 		void* cxl_addr_;
 		SessionEntry* session_table_;
+        SessionPublicationGate session_publication_gate_;
+        void StopForCapacityExhaustion();
 
 		// Replication
 		std::unique_ptr<Corfu::CorfuReplicationClient> corfu_replication_client_;
@@ -864,6 +867,7 @@ class Topic {
 
 		// [[LOCKFREE_PBR]] 128-bit CAS state; fallback to mutex when not lock-free (docs/LOCKFREE_PBR_DESIGN.md)
 		alignas(64) std::atomic<PBRProducerState> pbr_state_{{0, 0}};
+		std::atomic_flag pbr_refresh_busy_ = ATOMIC_FLAG_INIT;
 		alignas(64) std::atomic<uint64_t> cached_consumed_seq_{0};  // Slot sequence from consumed_through / sizeof(BatchHeader)
 		const size_t num_slots_;                         // BATCHHEADERS_SIZE / sizeof(BatchHeader), set in ctor
 		bool use_lock_free_pbr_{false};                  // True when pbr_state_.is_lock_free()
@@ -893,12 +897,15 @@ class Topic {
 		// TInode cache
 		int replication_factor_;
 		void* ordered_offset_addr_;
-		void* current_segment_;
+		const uintptr_t initial_segment_base_;
+		std::atomic<void*> current_segment_;
+		void* SegmentForAddress(void* address) const;
 		absl::Mutex segment_rollover_mu_;
 		uint64_t segment_id_counter_{0};
 		uint64_t segment_generation_{0};
 		std::deque<void*> retired_segments_ ABSL_GUARDED_BY(segment_rollover_mu_);
-		void MaybeGCRetiredSegments();
+		// Retired segments remain allocated until the cluster is destroyed.
+		std::atomic<bool> order5_capacity_exhausted_{false};
 		size_t ordered_offset_;
 
 		// Thread control

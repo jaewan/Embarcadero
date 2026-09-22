@@ -63,8 +63,16 @@ HeartBeatServiceImpl::HeartBeatServiceImpl(std::string head_addr) {
 			});
 }
 
+void HeartBeatServiceImpl::RequestShutdown() {
+    {
+      std::lock_guard<std::mutex> lock(heartbeat_wait_mutex_);
+      shutdown_.store(true, std::memory_order_release);
+    }
+    heartbeat_wait_cv_.notify_all();
+}
+
 HeartBeatServiceImpl::~HeartBeatServiceImpl() {
-	shutdown_ = true;
+    RequestShutdown();
 	if (heartbeat_thread_.joinable()) {
 		heartbeat_thread_.join();
 	}
@@ -80,17 +88,24 @@ Status HeartBeatServiceImpl::RegisterNode(
 
 	{
 		absl::MutexLock lock(&mutex_);
+        const auto head = nodes_.find("0");
+        if (shutdown_.load(std::memory_order_acquire) || head == nodes_.end() ||
+            !head->second.accepts_publishes) {
+          return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+              "Head shared region and data listener are not ready for registration");
+        }
 		auto nodes_it = nodes_.find(request->node_id());
-		int broker_id = static_cast<int>(nodes_.size());
+		const int broker_id = next_broker_id_;
+        const int broker_limit = static_cast<int>(NUM_MAX_BROKERS_CONFIG);
 
-		if (nodes_it != nodes_.end() || broker_id >= NUM_MAX_BROKERS) {
+		if (nodes_it != nodes_.end() || broker_id >= broker_limit) {
 			reply->set_success(false);
 			reply->set_broker_id(broker_id);
 
-			if (broker_id < NUM_MAX_BROKERS) {
+			if (broker_id < broker_limit) {
 				reply->set_message("Node already registered");
 			} else {
-				reply->set_message("Trying to Register too many brokers. Increase NUM_MAX_BROKERS");
+				reply->set_message("Configured broker capacity exhausted; start a fresh region for new identities");
 			}
 		} else {
 			VLOG(3) << "Registering node:" << request->address() << " broker:" << broker_id;
@@ -106,6 +121,7 @@ Status HeartBeatServiceImpl::RegisterNode(
 				false  // Publishability is flipped on only after the data listener is live.
 			};
 
+            ++next_broker_id_;
 			reply->set_success(true);
 			reply->set_broker_id(broker_id);
 			reply->set_message("Node registered successfully");
@@ -221,7 +237,7 @@ grpc::Status HeartBeatServiceImpl::SubscribeToCluster(
 		last_sent_version = cluster_version_;
 	}
 
-	while (!context->IsCancelled()) {
+	while (!shutdown_.load(std::memory_order_acquire) && !context->IsCancelled()) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
 		uint64_t current_version = 0;
@@ -305,35 +321,48 @@ void HeartBeatServiceImpl::SetAcceptsPublishes(int broker_id, bool accepts) {
 }
 
 grpc::Status HeartBeatServiceImpl::TerminateCluster(
-		grpc::ServerContext* context,
-		const google::protobuf::Empty* request,
-		google::protobuf::Empty* response) {
+        grpc::ServerContext* context,
+        const google::protobuf::Empty* request,
+        google::protobuf::Empty* response) {
+    (void)request;
+    (void)response;
+    std::shared_ptr<grpc::Server> server;
+    {
+        absl::MutexLock lock(&mutex_);
+        server = server_;
+    }
+    if (!server) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "Control server is not initialized");
 
-	LOG(INFO) << "[HeartBeatServiceImpl] TerminateCluster called, shutting down server.";
-	shutdown_ = true;
-
-	if (heartbeat_thread_.joinable()) {
-		heartbeat_thread_.join();  // Stop the heartbeat thread before shutting down the server
-	}
-
-	// Wait until other nodes in the cluster have shut down
-	while (true) {
-		{
-			absl::MutexLock lock(&mutex_);
-			if (nodes_.size() <= 1) {
-				break;
-			}
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	}
-
-	// Schedule the server shutdown
-	std::thread([this]() {
-			std::this_thread::sleep_for(std::chrono::seconds(1));
-			server_->Shutdown();
-			}).detach();
-
-	return grpc::Status::OK;
+    LOG(INFO) << "[HeartBeatServiceImpl] TerminateCluster requested";
+    RequestShutdown();
+    // Followers acknowledge through their next heartbeat. A dead follower must
+    // not hold this RPC (and an external Server::Shutdown) forever. Joining the
+    // heartbeat thread belongs to the destructor, not concurrent RPC handlers.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    grpc::Status result = grpc::Status::OK;
+    for (;;) {
+        if (context->IsCancelled()) {
+            result = grpc::Status(grpc::StatusCode::CANCELLED, "Cluster shutdown request cancelled");
+            break;
+        }
+        {
+            absl::MutexLock lock(&mutex_);
+            if (nodes_.size() <= 1) break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline ||
+            std::chrono::system_clock::now() >= context->deadline()) {
+            result = grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                "Follower shutdown acknowledgements timed out; stopping local control server");
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    // Shutdown waits for handlers, so perform it outside this handler. Retain
+    // the server itself: capturing this could outlive HeartBeatServiceImpl.
+    std::thread([server = std::move(server)] {
+        server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+    }).detach();
+    return result;
 }
 
 grpc::Status HeartBeatServiceImpl::KillBrokers(
@@ -402,11 +431,25 @@ grpc::Status HeartBeatServiceImpl::CreateNewTopic(
 		const CreateTopicRequest* request,
 		CreateTopicResponse* reply) {
 
+    const auto& requested_topic = request->topic();
+    if (requested_topic.empty() || requested_topic.size() >= TOPIC_NAME_SIZE ||
+        requested_topic.find('\0') != std::string::npos) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+            "Topic name must be nonempty, shorter than TOPIC_NAME_SIZE, and contain no NUL");
+    }
+    Embarcadero::CreateTopicEntryCallback create;
+    {
+        absl::MutexLock lock(&mutex_);
+        create = create_topic_entry_callback_;
+    }
+    if (!create || shutdown_.load(std::memory_order_acquire)) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "Topic service is not initialized");
+    }
 	char topic[TOPIC_NAME_SIZE] = {0};
 	size_t copy_size = std::min(request->topic().size(), static_cast<size_t>(TOPIC_NAME_SIZE - 1));
 	memcpy(topic, request->topic().data(), copy_size);
 
-	bool success = create_topic_entry_callback_(
+	bool success = create(
 			topic,
 			static_cast<int>(request->order()),
 			static_cast<int>(request->replication_factor()),
@@ -464,6 +507,28 @@ std::string HeartBeatServiceImpl::GetNextBrokerAddr(int broker_id) {
 	return nullptr;
 }
 
+std::vector<int> HeartBeatServiceImpl::GetLiveBrokerIds() {
+    absl::MutexLock lock(&mutex_);
+    std::vector<int> ids;
+    for (const auto& entry : nodes_) {
+        if (entry.second.accepts_publishes) ids.push_back(entry.second.broker_id);
+    }
+    return ids;
+}
+
+std::vector<int> FollowerNodeClient::GetLiveBrokerIds() {
+    absl::MutexLock lock(&cluster_mutex_);
+    std::vector<int> ids;
+    for (const auto& entry : cluster_nodes_) {
+        if (entry.second.accepts_publishes) ids.push_back(entry.first);
+    }
+    return ids;
+}
+
+std::vector<int> HeartBeatManager::GetLiveBrokerIds() {
+    return is_head_node_ ? service_->GetLiveBrokerIds() : follower_->GetLiveBrokerIds();
+}
+
 int HeartBeatServiceImpl::GetNumBrokers () {
 	static size_t initial_num_node = nodes_.size();
 	if (initial_num_node != nodes_.size()) {
@@ -479,7 +544,11 @@ void HeartBeatServiceImpl::CheckHeartbeats() {
 	bool cluster_changed = false;
 
 	while (!shutdown_) {
-		std::this_thread::sleep_for(std::chrono::seconds(timeout_seconds));
+        {
+          std::unique_lock<std::mutex> lock(heartbeat_wait_mutex_);
+          if (heartbeat_wait_cv_.wait_for(lock, std::chrono::seconds(timeout_seconds),
+              [this] { return shutdown_.load(std::memory_order_acquire); })) break;
+        }
 		cluster_changed = false;
 
 		{
@@ -551,12 +620,14 @@ void HeartBeatServiceImpl::FillClusterInfo(HeartbeatResponse* reply, bool force_
 }
 
 void HeartBeatServiceImpl::SetServer(std::shared_ptr<grpc::Server> server) {
-	server_ = server;
+    absl::MutexLock lock(&mutex_);
+	server_ = std::move(server);
 }
 
 void HeartBeatServiceImpl::RegisterCreateTopicEntryCallback(
 		Embarcadero::CreateTopicEntryCallback callback) {
-	create_topic_entry_callback_ = callback;
+    absl::MutexLock lock(&mutex_);
+	create_topic_entry_callback_ = std::move(callback);
 }
 
 //
@@ -776,7 +847,7 @@ void FollowerNodeClient::ProcessClusterInfo(const HeartbeatResponse& reply) {
 
 	{
 		absl::MutexLock lock(&cluster_mutex_);
-		if (new_version <= cluster_version_ && reply.cluster_info_size() == 0) {
+		if (new_version <= cluster_version_) {
 			return;  // We already have this version or newer
 		}
 
@@ -841,6 +912,7 @@ void HeartBeatManager::Wait() {
 
 void HeartBeatManager::RequestShutdown() {
 	if (is_head_node_) {
+        if (service_) service_->RequestShutdown();
 		if (server_) server_->Shutdown();
 	} else {
 		if (follower_) follower_->RequestShutdown();

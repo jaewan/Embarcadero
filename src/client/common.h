@@ -26,10 +26,12 @@
 #include <glog/logging.h>
 #include <mimalloc.h>
 #include "absl/synchronization/mutex.h"
+#include "absl/container/flat_hash_set.h"
 #include "folly/ProducerConsumerQueue.h"
 
 #include "common/config.h"
-#include "cxl_manager/cxl_manager.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "network_manager/protocol.h"
 #include "corfu_client.h"
 #include "session_client_utils.h"
 #include <heartbeat.grpc.pb.h>
@@ -45,6 +47,7 @@
 #define BATCH_OPTIMIZATION 1
 
 using heartbeat_system::HeartBeat;
+using heartbeat_system::ClusterStatus;
 using heartbeat_system::SequencerType;
 
 // Forward declarations

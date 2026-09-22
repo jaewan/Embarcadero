@@ -1,4 +1,5 @@
 #include "topic.h"
+#include "topic_session_key.h"
 #include "cxl_manager/scalog_local_sequencer.h"
 #include "cxl_manager/lazylog_local_sequencer.h"
 #include "common/ack_rf_policy.h"
@@ -7,6 +8,7 @@
 #include "common/wire_formats.h"
 #include "common/order_level.h"
 #include "common/env_flags.h"
+#include "common/fault_injection.h"
 #include "order5_tr_trace.h"
 
 #include <algorithm>
@@ -226,20 +228,6 @@ static inline bool ShouldCaptureOrder5Flight(int order, int broker_id) {
 	return Order5FlightTraceEnabled() && order == 5 && broker_id == 0;
 }
 
-static inline uint64_t MakeSessionKey(size_t client_id, uint32_t session_epoch) {
-	return (static_cast<uint64_t>(static_cast<uint32_t>(client_id)) << 32) |
-	       static_cast<uint64_t>(session_epoch);
-}
-
-static inline uint64_t Mix64(uint64_t x) {
-	x ^= x >> 33;
-	x *= 0xff51afd7ed558ccdULL;
-	x ^= x >> 33;
-	x *= 0xc4ceb9fe1a85ec53ULL;
-	x ^= x >> 33;
-	return x;
-}
-
 static inline uint64_t MakeClientBrokerStreamKey(size_t client_id, uint32_t session_epoch, int broker_id) {
 	if (session_epoch == 0) {
 		return (static_cast<uint64_t>(client_id) << 16) |
@@ -254,8 +242,6 @@ static inline uint64_t MakeClientBrokerStreamKey(size_t client_id, int broker_id
 	       static_cast<uint16_t>(broker_id & 0xFFFF);
 }
 
-static constexpr uint64_t kSessionEntryFlagFenced = 1ULL << 0;
-static constexpr uint64_t kSessionEntryFlagActive = 1ULL << 1;
 
 static inline bool UsesTrueClientChainOrdering(int order) {
 	return order == kOrderStrong;
@@ -374,43 +360,6 @@ void Topic::RecordOrder5FlightEvent(
 	slot.d = d;
 }
 
-SessionEntry* Topic::FindSessionEntry(uint64_t session_key) {
-	if (session_key == 0 || session_table_ == nullptr) return nullptr;
-	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
-	for (size_t probe = 0; probe < kMaxSessions; ++probe) {
-		SessionEntry* entry = &session_table_[(start + probe) % kMaxSessions];
-		CXL::invalidate_cacheline_for_read(entry);
-		CXL::load_fence();
-		const uint64_t observed = entry->session_key.load(std::memory_order_acquire);
-		if (observed == session_key) return entry;
-		if (observed == 0) return nullptr;
-	}
-	return nullptr;
-}
-
-SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
-	if (session_key == 0 || session_table_ == nullptr) return nullptr;
-	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
-	for (size_t probe = 0; probe < kMaxSessions; ++probe) {
-		SessionEntry* entry = &session_table_[(start + probe) % kMaxSessions];
-		uint64_t observed = entry->session_key.load(std::memory_order_acquire);
-		if (observed == session_key) {
-			return entry;
-		}
-		if (observed == 0) {
-			uint64_t expected = 0;
-			if (entry->session_key.compare_exchange_strong(
-					expected, session_key, std::memory_order_acq_rel, std::memory_order_acquire) ||
-					expected == session_key) {
-				return entry;
-			}
-		}
-	}
-	LOG(ERROR) << "SessionEntry table full for topic=" << topic_name_
-	           << " session_key=" << session_key;
-	return nullptr;
-}
-
 void Topic::ReconstructClientStateFromSessionEntry(uint64_t session_key, ClientState5& state) {
 	ApplyRecoveredSequencer5State(session_key, state);
 	SessionEntry* entry = FindSessionEntry(session_key);
@@ -437,27 +386,6 @@ void Topic::ReconstructClientStateFromSessionEntry(uint64_t session_key, ClientS
 		state.fenced = true;
 	}
 	ApplyRecoveredSequencer5State(session_key, state);
-}
-
-void Topic::PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot) {
-	if (snapshot.session_epoch == 0) return;
-	SessionEntry* entry = FindOrCreateSessionEntry(session_key);
-	if (entry == nullptr) return;
-
-	entry->expected_seq.store(snapshot.expected_seq, std::memory_order_relaxed);
-	entry->committed_hwm.store(snapshot.committed_hwm, std::memory_order_relaxed);
-	entry->highest_sequenced.store(snapshot.highest_sequenced, std::memory_order_relaxed);
-	CXL::store_fence();
-	CXL::flush_cacheline(entry);
-	CXL::store_fence();
-
-	const uint64_t flags = kSessionEntryFlagActive |
-		(snapshot.fenced ? kSessionEntryFlagFenced : 0);
-	const uint64_t state_word = (static_cast<uint64_t>(snapshot.session_epoch) << 32) | flags;
-	entry->state_word.store(state_word, std::memory_order_release);
-	CXL::store_fence();
-	CXL::flush_cacheline(&entry->state_word);
-	CXL::store_fence();
 }
 
 void Topic::ApplyRecoveredSequencer5State(uint64_t session_key, ClientState5& state) {
@@ -611,6 +539,7 @@ Topic::Topic(
 	logical_offset_(0),
 	written_logical_offset_((size_t)-1),
 	num_slots_(BATCHHEADERS_SIZE / sizeof(BatchHeader)),
+	initial_segment_base_(reinterpret_cast<uintptr_t>(segment_metadata)),
 	current_segment_(segment_metadata) {
 
 		// Validate tinode pointer first
@@ -645,6 +574,8 @@ Topic::Topic(
 #else
 		use_lock_free_pbr_ = pbr_state_.is_lock_free();
 #endif
+        LOG(INFO) << "PBR reservation mode=" << (use_lock_free_pbr_ ? "atomic128" : "mutex")
+                  << " slots=" << num_slots_ << " topic=" << topic_name_;
 		if (num_slots_ == 0) {
 			LOG(ERROR) << "PBR num_slots_ is 0 for topic " << topic_name_
 				<< " (BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
@@ -1523,111 +1454,53 @@ void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, B
 	CXL::store_fence();
 }
 
-/**
- * Ensure the reserved [log, log+msgSize) lies entirely inside the current segment.
- * If allocation already crossed the end, seal and roll to a new segment (fail-closed
- * if no segment is available). Callers that can check first should prefer
- * ReserveBLogSpace / TryReserveBLogSpaceFailClosed which reserve before crossing.
- * @return false when CXL segments are exhausted — caller must not write past end.
- */
-bool Topic::CheckSegmentBoundary(
-		void* log,
-		size_t msgSize,
-		unsigned long long int segment_metadata) {
-
-	const uintptr_t log_addr = reinterpret_cast<uintptr_t>(log);
-	const uintptr_t segment_end = segment_metadata + SEGMENT_SIZE;
-
-	if (segment_end > log_addr + msgSize) {
-		return true;
-	}
-
-	absl::MutexLock lock(&segment_rollover_mu_);
-	// Re-read under lock; another thread may have already rolled.
-	const uintptr_t cur_seg = reinterpret_cast<uintptr_t>(current_segment_);
-	const uintptr_t cur_end = cur_seg + SEGMENT_SIZE;
-	const uintptr_t cur_log = log_addr_.load(std::memory_order_acquire);
-	if (cur_seg != 0 && cur_end > cur_log + msgSize) {
-		// Fits in the live segment (possibly after a concurrent rollover that
-		// invalidated the caller's stale segment_metadata).
-		return true;
-	}
-
-	LOG(WARNING) << "Segment size limit reached (" << SEGMENT_SIZE
-	             << "); attempting rollover topic=" << topic_name_
-	             << " broker=" << broker_id_;
-
-	// Seal: persist written high-water relative to this segment.
-	if (current_segment_ != nullptr && cur_log >= cur_seg) {
-		*reinterpret_cast<unsigned long long int*>(current_segment_) =
-			cur_log - cur_seg;
-		CXL::store_fence();
-		CXL::flush_cacheline(current_segment_);
-		CXL::store_fence();
-	}
-
-	void* next = get_new_segment_callback_ ? get_new_segment_callback_() : nullptr;
-	if (next == nullptr) {
-		LOG(ERROR) << "Segment rollover failed: CXL segments exhausted "
-		           << "topic=" << topic_name_ << " broker=" << broker_id_;
-		blog_capacity_exhausted_.store(true, std::memory_order_release);
-		return false;
-	}
-
-	// Durable segment identity header (first 64 bytes):
-	// [0]=written_hwm, [8]=segment_id, [16]=generation, [24]=prev_cxl_offset
-	auto* header = reinterpret_cast<uint64_t*>(next);
-	header[0] = 0;
-	header[1] = ++segment_id_counter_;
-	header[2] = ++segment_generation_;
-	header[3] = (cxl_addr_ != nullptr)
-		? (reinterpret_cast<uintptr_t>(current_segment_) - reinterpret_cast<uintptr_t>(cxl_addr_))
-		: 0;
-	CXL::store_fence();
-	CXL::flush_cacheline(next);
-	CXL::store_fence();
-
-	retired_segments_.push_back(current_segment_);
-	current_segment_ = next;
-	// Skip 64B header like initial segment setup.
-	const uintptr_t new_base = reinterpret_cast<uintptr_t>(next) + 64;
-	log_addr_.store(new_base, std::memory_order_release);
-	blog_capacity_exhausted_.store(false, std::memory_order_release);
-	LOG(INFO) << "Segment rolled topic=" << topic_name_
-	          << " broker=" << broker_id_
-	          << " segment_id=" << header[1]
-	          << " generation=" << header[2]
-	          << " new_base=" << reinterpret_cast<void*>(new_base);
-	return true;
+// Segment addresses share the allocator's immutable SEGMENT_SIZE grid. This
+// recovers a reservation's original segment after other threads roll forward.
+void* Topic::SegmentForAddress(void* address) const {
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+  const size_t remainder = addr >= initial_segment_base_
+      ? (addr - initial_segment_base_) % SEGMENT_SIZE
+      : (SEGMENT_SIZE - (initial_segment_base_ - addr) % SEGMENT_SIZE) % SEGMENT_SIZE;
+  return reinterpret_cast<void*>(addr - remainder);
 }
 
-void Topic::MaybeGCRetiredSegments() {
-	// Retention floor: keep a few retired segments for reconstruction/recovery windows.
-	// GC returns CXL capacity once FreeSegment is wired; otherwise bound the tracking deque.
-	static constexpr size_t kRetainRetired = 2;
-	static constexpr size_t kMaxTrackedRetired = 64;
-	absl::MutexLock lock(&segment_rollover_mu_);
-	while (retired_segments_.size() > kRetainRetired) {
-		void* seg = retired_segments_.front();
-		if (free_segment_callback_) {
-			if (!free_segment_callback_(seg)) {
-				LOG(WARNING) << "MaybeGCRetiredSegments: FreeSegment failed topic="
-				             << topic_name_ << " seg=" << seg;
-				break;
-			}
-			retired_segments_.pop_front();
-			continue;
-		}
-		if (retired_segments_.size() <= kMaxTrackedRetired) {
-			break;
-		}
-		LOG(WARNING) << "MaybeGCRetiredSegments: dropping oldest retired segment tracking entry "
-		             << "(FreeSegment callback unset); topic=" << topic_name_;
-		retired_segments_.pop_front();
-	}
-	// blog_capacity_exhausted_ is cleared only in CheckSegmentBoundary after a
-	// successful rollover — freeing a retired segment does not prove a new one is available.
+bool Topic::CheckSegmentBoundary(void* log, size_t msgSize,
+                                 unsigned long long segment_metadata) {
+  (void)log;
+  (void)segment_metadata;
+  if (msgSize == 0 || SEGMENT_SIZE <= 64 || msgSize > SEGMENT_SIZE - 64)
+    return false;
+  absl::MutexLock lock(&segment_rollover_mu_);
+  const bool available = TryRolloverSegment(current_segment_, log_addr_, SEGMENT_SIZE,
+      msgSize, [this](void* old_segment, uintptr_t cursor) -> void* {
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+        uint64_t reject = 0;
+        if (!fault::Pause("storage.before_rollover_allocate",
+                {UINT64_MAX, UINT64_MAX, retired_segments_.size(),
+                 reinterpret_cast<uintptr_t>(old_segment), cursor}, &stop_threads_, &reject) || reject)
+            return nullptr;
+#endif
+        void* next = get_new_segment_callback_ ? get_new_segment_callback_() : nullptr;
+        if (!next) return nullptr;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(old_segment);
+        // Reservation high-water, not proof of receive completion. Active
+        // receives/readers/replicas still own old bytes; never reclaim them.
+        *static_cast<uint64_t*>(old_segment) = cursor - base;
+        CXL::flush_cacheline(old_segment);
+        auto* header = static_cast<uint64_t*>(next);
+        header[0] = 0;
+        header[1] = ++segment_id_counter_;
+        header[2] = ++segment_generation_;
+        header[3] = cxl_addr_ ? base - reinterpret_cast<uintptr_t>(cxl_addr_) : 0;
+        CXL::flush_cacheline(next);
+        CXL::store_fence();
+        retired_segments_.push_back(old_segment);
+        return next;
+      });
+  if (!available) blog_capacity_exhausted_.store(true, std::memory_order_release);
+  return available;
 }
+
 
 std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(
 		BatchHeader &batch_header,
@@ -1647,17 +1520,14 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(
 		absl::MutexLock lock(&mutex_);
 
 		// Allocate space in the log
-		log = reinterpret_cast<void*>(log_addr_.fetch_add(batch_header.total_size));
+		log = TryReserveBLogSpaceFailClosed(batch_header.total_size, true);
+        if (!log) { batch_header_location = nullptr; return nullptr; }
 		logical_offset = logical_offset_;
-		segment_header = current_segment_;
+		segment_header = SegmentForAddress(log);
 		start_logical_offset = logical_offset_;
 		logical_offset_ += batch_header.num_msg;
 
-		// Check for segment boundary issues
-		if (reinterpret_cast<unsigned long long int>(current_segment_) + SEGMENT_SIZE <= log_addr_) {
-			LOG(ERROR) << "!!!!!!!!! Increase the Segment Size: " << SEGMENT_SIZE;
-			// TODO(Jae) Finish below segment boundary crossing code
-		}
+
 	}
 
 	// Return completion callback function
@@ -1689,12 +1559,8 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(
 							reinterpret_cast<uint8_t*>(log_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_))
 						);
 
-				// Update segment header
-				*reinterpret_cast<unsigned long long int*>(current_segment_) =
-					static_cast<unsigned long long int>(
-							reinterpret_cast<uint8_t*>(log_ptr) -
-							reinterpret_cast<uint8_t*>(current_segment_)
-							);
+                // Segment reservation high-water is sealed by rollover. A callback
+                // may finish after rollover and must not write the new segment header.
 
 				// Move to next logical offset
 				kafka_logical_offset_.store(logical_offset + 1);
@@ -1728,19 +1594,22 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	}
 
 	// Calculate addresses
-	const unsigned long long int segment_metadata =
-		reinterpret_cast<unsigned long long int>(current_segment_);
 	const size_t msg_size = batch_header.total_size;
 	BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
 	const size_t slot = batch_header.batch_seq % num_slots_;
 	BatchHeader* slot_header = &batch_header_log[slot];
 
 	// Get log address with batch offset
-	log = reinterpret_cast<void*>(log_addr_.load()
-			+ batch_header.log_idx);
-
-	// Check for segment boundary issues
-	CheckSegmentBoundary(log, msg_size, segment_metadata);
+    uintptr_t assigned_address;
+    if (!LocateAssignedPayload(initial_segment_base_,
+          reinterpret_cast<uintptr_t>(first_message_addr_), SEGMENT_SIZE,
+          batch_header.log_idx, msg_size, assigned_address)) {
+      log = nullptr;
+      blog_capacity_exhausted_.store(true, std::memory_order_release);
+      return nullptr;
+    }
+    log = reinterpret_cast<void*>(assigned_address);
+    segment_header = reinterpret_cast<void*>(initial_segment_base_);
 
 	slot_header->batch_seq = batch_header.batch_seq;
 	slot_header->pbr_absolute_index = batch_header.batch_seq;
@@ -2390,21 +2259,23 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(
 	auto& client_seq = order3_client_batch_[batch_header.client_id];
 	while (client_seq < batch_header.batch_seq) {
 		// Allocate space for skipped batch
-		void* skipped_addr = reinterpret_cast<void*>(log_addr_.load());
+		void* skipped_addr = TryReserveBLogSpaceFailClosed(batch_header.total_size, true);
+        if (!skipped_addr) { log = nullptr; return nullptr; }
 
 		// Store for later retrieval
 		skipped_batch_[batch_header.client_id].emplace(client_seq, skipped_addr);
 
 		// Move log address forward (assuming same batch size)
-		log_addr_ += batch_header.total_size;
+
 
 		// Update client sequence
 		client_seq += num_brokers;
 	}
 
 	// Allocate space for this batch
-	log = reinterpret_cast<void*>(log_addr_.load());
-	log_addr_ += batch_header.total_size;
+	log = TryReserveBLogSpaceFailClosed(batch_header.total_size, true);
+    if (!log) return nullptr;
+    segment_header = SegmentForAddress(log);
 	client_seq += num_brokers;
 
 	return nullptr;
@@ -2447,8 +2318,6 @@ __attribute__((cold, noinline)) std::function<void(void*, size_t)> Topic::Order4
 	}
 
 	// Calculate base addresses
-	const unsigned long long int segment_metadata =
-		reinterpret_cast<unsigned long long int>(current_segment_);
 	const size_t msg_size = batch_header.total_size;
 	void* batch_headers_log;
 
@@ -2456,7 +2325,8 @@ __attribute__((cold, noinline)) std::function<void(void*, size_t)> Topic::Order4
 		absl::MutexLock lock(&mutex_);
 
 		// Allocate space in log
-		log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
+		log = TryReserveBLogSpaceFailClosed(msg_size, true);
+    if (!log) { batch_header_location = nullptr; return nullptr; }
 
 		// Allocate space for batch header (wrap within ring)
 		batch_headers_log = reinterpret_cast<void*>(batch_headers_);
@@ -2472,7 +2342,7 @@ __attribute__((cold, noinline)) std::function<void(void*, size_t)> Topic::Order4
 	}
 
 	// Check for segment boundary
-	CheckSegmentBoundary(log, msg_size, segment_metadata);
+	segment_header = SegmentForAddress(log);
 
 	// Update batch header fields
 	batch_header.start_logical_offset = logical_offset;
@@ -2531,16 +2401,15 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
     batch_header_location = &batch_header_ring[slot_idx];
 
 	// Calculate addresses
-	const unsigned long long int segment_metadata =
-		reinterpret_cast<unsigned long long int>(current_segment_);
 	const size_t msg_size = batch_header.total_size;
 
 	// Allocate space in log
-	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
+	log = TryReserveBLogSpaceFailClosed(msg_size, true);
+    if (!log) { batch_header_location = nullptr; return nullptr; }
     batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
 
 	// Check for segment boundary
-	CheckSegmentBoundary(log, msg_size, segment_metadata);
+	segment_header = SegmentForAddress(log);
 
 	// Install the same unpublished ownership claim used by the common
 	// post-receive PBR path. Scalog reserves before recv so its replication
@@ -2607,13 +2476,12 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
 	batch_header_location = &batch_header_ring[slot_idx];
 
-	const unsigned long long int segment_metadata =
-		reinterpret_cast<unsigned long long int>(current_segment_);
 	const size_t msg_size = batch_header.total_size;
 
-	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
+	log = TryReserveBLogSpaceFailClosed(msg_size, true);
+    if (!log) { batch_header_location = nullptr; return nullptr; }
 	batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
-	CheckSegmentBoundary(log, msg_size, segment_metadata);
+	segment_header = SegmentForAddress(log);
 
 	// LazyLog shares Scalog's pre-receive reservation path and therefore needs
 	// the same complete ownership claim before PublishPBRSlotDirect validates it.
@@ -2742,6 +2610,19 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		return nullptr;
 	}
 
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+    if (!fault::Pause("ingress.after_blog_reserve",
+            {batch_header.client_id, batch_header.session_epoch, batch_header.batch_seq,
+             reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_), alloc_size},
+            &stop_threads_)) {
+        // The network allocation loop retries null while capacity is available.
+        // Cancellation must not burn a fresh reservation on every retry.
+        blog_capacity_exhausted_.store(true, std::memory_order_release);
+        log = nullptr;
+        return nullptr;
+    }
+#endif
+
 	// [[DESIGN: PBR reserve after receive]] Do NOT generate metadata or write the BatchHeader here.
 	// NetworkManager reserves a PBR slot after recv(payload) and generates metadata once.
 	// For non-EMBARCADERO sequencers: ReservePBRSlotAndWriteEntry generates metadata.
@@ -2793,33 +2674,16 @@ void* Topic::TryReserveBLogSpaceFailClosed(size_t size, bool epoch_already_check
 		if (was_stale) return nullptr;
 	}
 
-	for (int spin = 0; spin < 64; ++spin) {
-		void* seg_ptr = current_segment_;
-		const uintptr_t seg = reinterpret_cast<uintptr_t>(seg_ptr);
-		if (seg == 0) {
-			return nullptr;
-		}
-		unsigned long long cur = log_addr_.load(std::memory_order_acquire);
-		if (cur < seg) {
-			// Stale pairing of current_segment_ vs log_addr_; retry.
-			continue;
-		}
-		if (cur + size > seg + SEGMENT_SIZE) {
-			// Reserve-before-cross: roll before any past-end publish.
-			if (!CheckSegmentBoundary(reinterpret_cast<void*>(cur), size, seg)) {
-				return nullptr;
-			}
-			continue;
-		}
-		const unsigned long long next = cur + static_cast<unsigned long long>(size);
-		if (log_addr_.compare_exchange_weak(
-				cur, next,
-				std::memory_order_acq_rel,
-				std::memory_order_acquire)) {
-			MaybeGCRetiredSegments();
-			return reinterpret_cast<void*>(static_cast<uintptr_t>(cur));
-		}
-	}
+	if (IsBLogCapacityExhausted() || size == 0 || SEGMENT_SIZE <= 64 ||
+        size > SEGMENT_SIZE - 64) return nullptr;
+    for (int retry = 0; retry < 64; ++retry) {
+      const auto base = reinterpret_cast<uintptr_t>(
+          current_segment_.load(std::memory_order_acquire));
+      uintptr_t result;
+      if (TryReserveSegmentBytes(log_addr_, base, SEGMENT_SIZE, size, result))
+        return reinterpret_cast<void*>(result);
+      if (!CheckSegmentBoundary(nullptr, size, base)) return nullptr;
+    }
 	return nullptr;
 }
 
@@ -2831,18 +2695,22 @@ void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
 }
 
 void Topic::RefreshPBRConsumedThroughCache() {
-	const void* consumed_through_addr = const_cast<const void*>(
-		reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].batch_headers_consumed_through));
-	CXL::flush_cacheline(consumed_through_addr);
-	CXL::load_fence();
-	size_t consumed = tinode_->offsets[broker_id_].batch_headers_consumed_through;
-	cached_pbr_consumed_through_.store(consumed, std::memory_order_release);
-	// [[LOCKFREE_PBR]] Drive cached_consumed_seq_ for lock-free path (sentinel BATCHHEADERS_SIZE → seq 0)
-	if (consumed == BATCHHEADERS_SIZE) {
-		cached_consumed_seq_.store(0, std::memory_order_release);
-	} else {
-		cached_consumed_seq_.store(static_cast<uint64_t>(consumed / sizeof(BatchHeader)), std::memory_order_release);
-	}
+  // One observer at a time prevents a delayed modulo sample looking like a
+  // second lap. Contending producers use the conservative existing cache.
+  if (pbr_refresh_busy_.test_and_set(std::memory_order_acquire)) return;
+  const void* addr = const_cast<const void*>(reinterpret_cast<const volatile void*>(
+      &tinode_->offsets[broker_id_].batch_headers_consumed_through));
+  CXL::flush_cacheline(addr);
+  CXL::load_fence();
+  const size_t consumed = tinode_->offsets[broker_id_].batch_headers_consumed_through;
+  if (consumed <= BATCHHEADERS_SIZE && consumed % sizeof(BatchHeader) == 0 && num_slots_ >= 2) {
+    cached_pbr_consumed_through_.store(consumed, std::memory_order_release);
+    const uint64_t modulo = consumed == BATCHHEADERS_SIZE ? 0 : consumed / sizeof(BatchHeader);
+    const auto previous = cached_consumed_seq_.load(std::memory_order_relaxed);
+    cached_consumed_seq_.store(UnwrapPBRConsumed(previous, modulo, num_slots_),
+                               std::memory_order_release);
+  }
+  pbr_refresh_busy_.clear(std::memory_order_release);
 }
 
 size_t Topic::GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg) {
@@ -2974,46 +2842,20 @@ bool Topic::IsPBRBelowLowWatermark(int low_pct) {
 	return (util < 0 || util <= low_pct);
 }
 
-bool Topic::ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset) {
-	if (num_slots_ == 0) return false;  // Config/size mismatch; avoid % 0 below
-
-	// [[PERF Phase 1.2]] One CXL read before CAS loop; avoid 200–500ns flush+fence on every retry.
-	// CAS failure = contention (another thread took a slot), not ring-full; no need to re-read CXL.
-	RefreshPBRConsumedThroughCache();
-
-	PBRProducerState current = pbr_state_.load(std::memory_order_acquire);
-	PBRProducerState next;
-	do {
-		uint64_t consumed_seq = cached_consumed_seq_.load(std::memory_order_acquire);
-		uint64_t in_flight = (current.next_slot_seq >= consumed_seq)
-			? (current.next_slot_seq - consumed_seq) : 0;
-
-		if (in_flight >= num_slots_ - 1) {
-			// Ring appears full — refresh from CXL to check if consumer advanced
-			RefreshPBRConsumedThroughCache();
-			consumed_seq = cached_consumed_seq_.load(std::memory_order_acquire);
-			in_flight = (current.next_slot_seq >= consumed_seq)
-				? (current.next_slot_seq - consumed_seq) : 0;
-			if (in_flight >= num_slots_ - 1)
-				return false;  // Genuinely full
-		}
-
-		next.next_slot_seq = current.next_slot_seq + 1;
-		next.logical_offset = current.logical_offset + num_msg;
-	} while (!pbr_state_.compare_exchange_weak(
-		current, next,
-		std::memory_order_acq_rel,
-		std::memory_order_acquire));
-
-	size_t slot_index = static_cast<size_t>(current.next_slot_seq % num_slots_);
-	out_byte_offset = slot_index * sizeof(BatchHeader);
-	out_logical_offset = static_cast<size_t>(current.logical_offset);
-	return true;
+bool Topic::ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset,
+                                    size_t& out_logical_offset, uint64_t& out_absolute) {
+  uint64_t slot, logical;
+  if (!TryReservePBR(pbr_state_, cached_consumed_seq_, num_slots_, num_msg,
+                     slot, logical, [this] { RefreshPBRConsumedThroughCache(); }, &out_absolute))
+    return false;
+  out_byte_offset = slot * sizeof(BatchHeader);
+  out_logical_offset = logical;
+  return true;
 }
 
 bool Topic::ReservePBRSlotCore(BatchHeader& batch_header, void* log, bool epoch_already_checked,
 		void*& batch_headers_log, size_t& logical_offset, void*& segment_header) {
-	if (!first_batch_headers_addr_) return false;
+	if (!first_batch_headers_addr_ || IsBLogCapacityExhausted()) return false;
 
 	uint64_t current_epoch;
 	if (!epoch_already_checked) {
@@ -3027,52 +2869,36 @@ bool Topic::ReservePBRSlotCore(BatchHeader& batch_header, void* log, bool epoch_
 		current_epoch = last_checked_epoch_.load(std::memory_order_acquire);
 	}
 
-	const unsigned long long int segment_metadata = reinterpret_cast<unsigned long long int>(current_segment_);
-	const size_t msg_size = batch_header.total_size;
 
+    uint64_t absolute_index;
 	if (use_lock_free_pbr_) {
 		size_t byte_offset;
-		if (!ReservePBRSlotLockFree(batch_header.num_msg, byte_offset, logical_offset))
+		if (!ReservePBRSlotLockFree(batch_header.num_msg, byte_offset, logical_offset, absolute_index))
 			return false;
 		batch_headers_log = reinterpret_cast<void*>(
 			reinterpret_cast<uintptr_t>(first_batch_headers_addr_) + byte_offset);
-	} else {
-		uint64_t n = pbr_cache_refresh_counter_.fetch_add(1, std::memory_order_relaxed);
-		if (n % kPBRCacheRefreshInterval == 0)
-			RefreshPBRConsumedThroughCache();
-		const unsigned long long int batch_headers_start =
-			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
-		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
-		{
-			absl::MutexLock lock(&mutex_);
-			size_t next_slot_offset = static_cast<size_t>(batch_headers_ - batch_headers_start);
-			size_t consumed_through = cached_pbr_consumed_through_.load(std::memory_order_acquire);
-			size_t effective_consumed = (consumed_through == BATCHHEADERS_SIZE) ? 0 : consumed_through;
-			size_t in_flight;
-			if (next_slot_offset >= effective_consumed)
-				in_flight = next_slot_offset - effective_consumed;
-			else
-				in_flight = (BATCHHEADERS_SIZE - effective_consumed) + next_slot_offset;
-			if (in_flight + sizeof(BatchHeader) >= BATCHHEADERS_SIZE)
-				return false;
-			batch_headers_log = reinterpret_cast<void*>(batch_headers_);
-			batch_headers_ += sizeof(BatchHeader);
-			if (batch_headers_ >= batch_headers_end)
-				batch_headers_ = batch_headers_start;
-			cached_next_slot_offset_.store(static_cast<size_t>(batch_headers_ - batch_headers_start), std::memory_order_release);
-			logical_offset = logical_offset_;
-			logical_offset_ += batch_header.num_msg;
-		}
-	}
+    } else {
+      // Platforms without the native 128-bit fast path retain the existing
+      // producer mutex but share the same absolute-sequence admission logic.
+      absl::MutexLock lock(&mutex_);
+      size_t byte_offset;
+      if (!ReservePBRSlotLockFree(batch_header.num_msg, byte_offset, logical_offset,
+                                 absolute_index)) return false;
+      batch_headers_log = reinterpret_cast<uint8_t*>(first_batch_headers_addr_) + byte_offset;
+      const size_t next_offset = ((absolute_index + 1) % num_slots_) * sizeof(BatchHeader);
+      batch_headers_ = reinterpret_cast<uintptr_t>(first_batch_headers_addr_) + next_offset;
+      cached_next_slot_offset_.store(next_offset, std::memory_order_release);
+      logical_offset_ = logical_offset + batch_header.num_msg;
+    }
 
-	CheckSegmentBoundary(log, msg_size, segment_metadata);
-	segment_header = current_segment_;
+	// Receive owns its original reservation; a concurrent rollover is harmless.
+	segment_header = SegmentForAddress(log);
 
 	batch_header.start_logical_offset = logical_offset;
 	batch_header.broker_id = broker_id_;
 	batch_header.ordered = 0;
 	batch_header.total_order = 0;
-	batch_header.pbr_absolute_index = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	batch_header.pbr_absolute_index = absolute_index;
 	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | batch_header.pbr_absolute_index;
 	batch_header.epoch_created = static_cast<uint16_t>(std::min(current_epoch, static_cast<uint64_t>(0xFFFF)));
 	batch_header.log_idx = static_cast<size_t>(
@@ -3693,6 +3519,7 @@ void Topic::AccumulateCVUpdate(
 void Topic::FlushAccumulatedCVLogicalOnly(
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index_plus_one) {
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
 	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
@@ -3794,6 +3621,7 @@ void Topic::FlushAccumulatedCV(
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index,
 		const std::array<bool, NUM_MAX_BROKERS>* touched) {
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 	// [PHASE-3] O(brokers) CXL writes + 1 fence (was O(batches) fences)
 	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
@@ -4849,6 +4677,14 @@ void Topic::EpochDriverThread() {
 					break;
 				}
 			}
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+            if (!fault::Pause("epoch.before_seal", {UINT64_MAX, UINT64_MAX, cur}, &stop_threads_)) {
+                // Controller cancellation is a stop request, not permission to
+                // bypass final sealing and the epoch_driver_done_ publication.
+                stop_threads_.store(true, std::memory_order_release);
+                break;
+            }
+#endif
 			if (cur_buf.seal()) {
 				uint64_t next = cur + 1;
 				// [[TR_TRACE]] Driver seal event -> tau (seal/commit period) distribution.
@@ -5075,6 +4911,20 @@ bool Topic::HaveAllScannerDrainsCompleted() {
  * CommitEpoch: Unified commit logic for both main loop and drain loop
  * Handles GOI writing, export chain setup, CV accumulation, and consumed_through advancement
  */
+void Topic::StopForCapacityExhaustion() {
+  // Call without the publication gate: shard workers acquire shard -> gate.
+  order5_capacity_exhausted_.store(true, std::memory_order_release);
+  stop_threads_.store(true, std::memory_order_release);
+  for (auto& shard : level5_shards_) {
+    if (!shard) continue;
+    {
+      std::lock_guard<std::mutex> lock(shard->mu);
+      shard->stop = true;
+    }
+    shard->cv.notify_all();
+  }
+}
+
 void Topic::CommitEpoch(
 		std::vector<PendingBatch5>& ready,
 		std::vector<const PendingBatch5*>& by_slot,
@@ -5084,6 +4934,9 @@ void Topic::CommitEpoch(
 		std::array<uint64_t, NUM_MAX_BROKERS>& cv_max_pbr_index,
 		std::vector<PendingBatch5>& batch_list,
 		bool is_drain_mode) {
+
+    auto publication_lock = session_publication_gate_.Lock();
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 
 	const bool commit_profile = ShouldEnableOrder5CommitProfile();
 	const auto commit_t_start = commit_profile ? std::chrono::steady_clock::now()
@@ -5103,14 +4956,17 @@ void Topic::CommitEpoch(
 		                      : std::chrono::steady_clock::time_point{};
 	};
 
+    bool admission_failed = false;
 	auto spatial_guard_reject = [&](PendingBatch5& p) {
 		if (p.skipped || p.is_held_marker) return false;
 		const uint32_t session_epoch = p.from_hold ? p.hold_meta.session_epoch : p.session_epoch;
 		if (session_epoch == 0) return false;
 		const size_t client_id = p.from_hold ? p.hold_meta.client_id : p.client_id;
 		const uint64_t batch_seq = p.from_hold ? p.hold_meta.batch_seq : p.batch_seq;
-		SessionEntry* entry = FindSessionEntry(MakeSessionKey(client_id, session_epoch));
-		if (entry == nullptr) return false;
+        const uint64_t session_key = MakeSessionKey(client_id, session_epoch);
+        SessionEntry* entry = FindSessionEntry(session_key);
+        if (!entry) entry = FindOrCreateSessionEntry(session_key);
+        if (!entry) { admission_failed = true; return false; }
 
 		CXL::invalidate_cacheline_for_read(entry);
 		CXL::load_fence();
@@ -5142,22 +4998,22 @@ void Topic::CommitEpoch(
 			<< " fenced=" << ((flags & kSessionEntryFlagFenced) != 0);
 		return true;
 	};
-	// [[OPT-GUARD]] Fast-path: skip spatial guard entirely when no session has ever been
-	// rejected (the common case on a healthy cluster). The guard only fires when a session
-	// is fenced mid-flight; once any reject occurs we revert to the full scan.
-	// Correctness: fencing is already enforced in classify_one (holds/drops fenced sessions
-	// before CommitEpoch); spatial_guard is a second, durable-CXL defense. Skipping it when
-	// order5_spatial_guard_rejects_==0 is safe because fencing has not occurred.
-	{
-		const auto guard_t = phase_now();
-		if (order5_spatial_guard_rejects_.load(std::memory_order_relaxed) > 0) {
-			ready.erase(
-				std::remove_if(ready.begin(), ready.end(), spatial_guard_reject),
-				ready.end());
-		}
-		phase_ns(order5_commit_guard_ns_, guard_t);
-	}
+    // Classification and commit are different phases. Check authoritative
+    // state every epoch, while the fence/commit publication gate is held.
+    {
+      const auto guard_t = phase_now();
+      ready.erase(std::remove_if(ready.begin(), ready.end(), spatial_guard_reject), ready.end());
+      phase_ns(order5_commit_guard_ns_, guard_t);
+    }
+
+    if (admission_failed) {
+      publication_lock.unlock();
+      StopForCapacityExhaustion();
+      LOG(ERROR) << "Authoritative session table full; refusing commit topic=" << topic_name_;
+      return;
+    }
 	if (ready.empty()) {
+        publication_lock.unlock();
 		const auto advance_t = phase_now();
 		AdvanceConsumedThroughForProcessedSlots(
 			batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch,
@@ -5178,12 +5034,54 @@ void Topic::CommitEpoch(
 	// consumption forever (see docs/experiments/YCSB_DISTRIBUTED_KV_PLAN.md Sec 6f). A
 	// held-but-not-yet-ready entry (is_held_marker) must also be excluded: its real num_msg is
 	// counted later, when it is actually delivered via the p.from_hold branch in a future epoch.
-	size_t total_msg = 0;
-	for (const PendingBatch5& p : ready) {
-		if (p.skipped || p.is_held_marker) continue;
-		total_msg += p.num_msg;
-	}
-	size_t base_order = global_seq_.fetch_add(total_msg, std::memory_order_relaxed);  // total_order space
+    size_t total_msg = 0;
+    size_t num_goi_order5 = 0;
+    bool count_overflow = false;
+    for (const PendingBatch5& p : ready) {
+      if (p.skipped || p.is_held_marker) continue;
+      if ((!p.from_hold && p.hdr == nullptr) ||
+          p.num_msg > std::numeric_limits<size_t>::max() - total_msg) {
+        count_overflow = true;
+        break;
+      }
+      total_msg += p.num_msg;
+      ++num_goi_order5;
+    }
+    uint64_t base_batch_index_order5 = 0;
+    size_t base_order = 0;
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+    // Physical layout stays unchanged. An immutable logical budget exercises
+    // the production all-or-nothing range reservation with bounded workloads.
+    static const uint64_t kGOICapacity = []() -> uint64_t {
+        constexpr uint64_t physical = 256ULL * 1024ULL * 1024ULL;
+        const char* value = std::getenv("EMBARCADERO_FAULT_GOI_CAPACITY");
+        if (!value) return physical;
+        char* end = nullptr;
+        errno = 0;
+        const auto parsed = std::strtoull(value, &end, 10);
+        if (errno || end == value || *end || !parsed || parsed > physical)
+            throw std::invalid_argument("invalid fault GOI budget");
+        return parsed;
+    }();
+#else
+    constexpr uint64_t kGOICapacity = 256ULL * 1024ULL * 1024ULL;
+#endif
+    if (count_overflow || !TryReserveCommitRanges(global_batch_seq_, global_seq_,
+          kGOICapacity, num_goi_order5, total_msg, base_batch_index_order5, base_order)) {
+      // Classification may already have advanced volatile session state. This is
+      // terminal for this topic: never retry with a changed identity, publish an
+      // ACK, or retire these slots. Existing committed prefixes remain readable.
+      publication_lock.unlock();
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+      (void)fault::Pause("capacity.commit_rejected",
+              {UINT64_MAX, UINT64_MAX, num_goi_order5, global_batch_seq_.load(), global_seq_.load()},
+              &stop_threads_);  // Cancellation must still latch the real capacity failure.
+#endif
+      StopForCapacityExhaustion();
+      LOG(ERROR) << "ORDER5 commit capacity exhausted; topic stopped without publishing epoch topic="
+                 << topic_name_;
+      return;
+    }
 
 	// [PHASE-2D] Fast-path: ready vector is already sorted by broker+slot before calling CommitEpoch
 	// Sorting is done in main loop and drain loop to preserve consumed_through contiguity.
@@ -5199,12 +5097,7 @@ void Topic::CommitEpoch(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
 
 	// [PANEL C2/P1] O(1) atomics per epoch: reserve GOI indices once (§3.2)
-	size_t num_goi_order5 = 0;
-	for (const PendingBatch5& p : ready) {
-		if (p.skipped || p.is_held_marker) continue;
-		if (p.from_hold || p.hdr != nullptr) num_goi_order5++;
-	}
-	uint64_t base_batch_index_order5 = global_batch_seq_.fetch_add(num_goi_order5, std::memory_order_relaxed);
+
 	size_t goi_idx_order5 = 0;
 	std::array<uint64_t, NUM_MAX_BROKERS> goi_cumulative_tracker{};
 	std::array<uint64_t, NUM_MAX_BROKERS> cv_cumulative_tracker{};
@@ -5612,7 +5505,11 @@ void Topic::CommitEpoch(
 		}
 	}
 	for (const auto& [session_key, snapshot] : session_publish_epoch) {
-		PublishSessionEntry(session_key, snapshot);
+        if (!PublishSessionEntry(session_key, snapshot)) {
+          publication_lock.unlock();
+          StopForCapacityExhaustion();
+          return;
+        }
 	}
 	if (commit_profile) {
 		order5_commit_metadata_ns_.fetch_add(
@@ -5674,6 +5571,9 @@ void Topic::CommitEpoch(
 			std::memory_order_relaxed);
 	}
 
+    // GOI and authoritative session publication are complete. Release before
+    // acquiring shard locks during retirement (fence paths hold shard -> gate).
+    publication_lock.unlock();
 	// Advance consumed_through for all remaining slots that were processed but not ready
 	{
 		const auto advance_t = phase_now();
@@ -6018,6 +5918,7 @@ void Topic::EpochSequencerThread() {
 			CommitEpoch(idle_ready_level5, idle_by_slot, idle_contiguous_consumed, idle_broker_seen,
 			           idle_cv_max_cumulative, idle_cv_max_pbr_index, idle_batch_list,
 			           /*is_drain_mode=*/false);
+        if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 			FlushAccumulatedCVLogicalOnly(idle_cv_logical_only_cumulative, idle_cv_logical_only_pbr_index);
 		} else {
 			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_logical_only_cumulative{};
@@ -6250,6 +6151,7 @@ void Topic::EpochSequencerThread() {
 		// Call unified commit logic
 		CommitEpoch(ready, by_slot, contiguous_consumed_per_broker, broker_seen_in_epoch,
 		           cv_max_cumulative, cv_max_pbr_index, batch_list, /*is_drain_mode=*/false);
+        if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 		FlushAccumulatedCVLogicalOnly(cv_logical_only_cumulative, cv_logical_only_pbr_index);
 
 		// [[FAST-SEAL]] After a clean commit, update the steady-state flag.
@@ -6360,6 +6262,7 @@ void Topic::EpochSequencerThread() {
 							CommitEpoch(ready_level5, drain_by_slot, drain_contiguous_consumed, drain_broker_seen,
 							           drain_cv_max_cumulative, drain_cv_max_pbr_index,
 							           empty_batch_list, /*is_drain_mode=*/true);
+        if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 							FlushAccumulatedCVLogicalOnly(
 								drain_cv_logical_only_cumulative, drain_cv_logical_only_pbr_index);
 						}
@@ -6554,6 +6457,7 @@ void Topic::EpochSequencerThread() {
 		}
 		CommitEpoch(ready, by_slot, contiguous_consumed_per_broker, broker_seen_in_epoch,
 		           drain_cv_max_cumulative, drain_cv_max_pbr_index, batch_list, /*is_drain_mode=*/true);
+        if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 		FlushAccumulatedCVLogicalOnly(
 			drain_cv_logical_only_cumulative, drain_cv_logical_only_pbr_index);
 	}
@@ -6720,6 +6624,7 @@ bool Topic::IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_ind
 }
 
 void Topic::RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size_t slot_offset) {
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 	InvalidateOrder5HeldSlot(hdr);
 	if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
 	if (slot_offset >= BATCHHEADERS_SIZE || (slot_offset % sizeof(BatchHeader)) != 0) return;
@@ -6741,6 +6646,7 @@ void Topic::RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size
 }
 
 void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready) {
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 	if (level5_shards_.empty()) {
 		LOG(FATAL) << "ProcessLevel5Batches: level5_shards_ empty (InitLevel5Shards was not run)";
 	}
@@ -6765,6 +6671,7 @@ void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector
 		Level5ShardState& shard = *level5_shards_[i];
 		{
 			std::lock_guard<std::mutex> lock(shard.mu);
+            if (shard.stop) return;
 			shard.input.swap(level5_per_shard_cache_[i]);
 			shard.ready.clear();
 			shard.done = false;
@@ -6776,7 +6683,8 @@ void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector
 	for (size_t i = 0; i < level5_num_shards_; ++i) {
 		Level5ShardState& shard = *level5_shards_[i];
 		std::unique_lock<std::mutex> lock(shard.mu);
-		shard.cv.wait(lock, [&shard]() { return shard.done; });
+		shard.cv.wait(lock, [&shard]() { return shard.done || shard.stop; });
+        if (shard.stop) return;
 		ready.insert(ready.end(),
 			std::make_move_iterator(shard.ready.begin()),
 			std::make_move_iterator(shard.ready.end()));
@@ -6860,9 +6768,21 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	};
 		auto record_fence = [&](size_t shard_session_key, ClientState5& state) {
 			if (!true_client_chain) return;
-			if (!CanFenceSessionEpoch(state.session_epoch)) return;
+            if (!CanFenceSessionEpoch(state.session_epoch)) return;
+            auto publication_lock = session_publication_gate_.Lock();
+            SessionEntry* committed_entry = FindOrCreateSessionEntry(shard_session_key);
+            if (!committed_entry) {
+              publication_lock.unlock();
+              StopForCapacityExhaustion();
+              return;
+            }
+            // next_expected in the classifier can include ready-but-uncommitted
+            // batches. A fence reports only the prefix published by CommitEpoch.
+            const uint64_t committed_expected = committed_entry->expected_seq.load(std::memory_order_acquire);
+            const uint64_t committed_hwm = committed_entry->committed_hwm.load(std::memory_order_acquire);
 			const bool first_fence = !state.fenced;
 			state.fence();
+            state.committed_hwm = committed_hwm;
 			if (first_fence || ShouldEnableOrder5SessionTestTrace()) {
 				LOG(WARNING) << "[ORDER5_SESSION_FENCE]"
 				             << " client=" << static_cast<uint32_t>(shard_session_key >> 32)
@@ -6874,17 +6794,21 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 			SessionPublishSnapshot snapshot;
 			snapshot.session_epoch = state.session_epoch;
-			snapshot.expected_seq = state.next_expected;
+			snapshot.expected_seq = committed_expected;
 			snapshot.committed_hwm = state.committed_hwm;
 			snapshot.highest_sequenced = state.highest_sequenced;
 			snapshot.fenced = true;
-			PublishSessionEntry(shard_session_key, snapshot);
+            if (!PublishSessionEntry(shard_session_key, snapshot)) {
+              publication_lock.unlock();
+              StopForCapacityExhaustion();
+              return;
+            }
 			if (first_fence) {
 				SessionFenceNotification note;
 				note.client_id = static_cast<uint32_t>(shard_session_key >> 32);
 				note.session_epoch = state.session_epoch;
 				note.committed_batch_seq = state.committed_hwm;
-				note.has_committed_prefix = state.HasCommittedPrefix();
+				note.has_committed_prefix = committed_expected > 0;
 				note.committed_msg_hwm = GetClientOrdered(note.client_id);
 				note.control_epoch = CurrentControlEpoch();
 				note.reason = 0;  // SessionFenced::HOLD_EXPIRY
@@ -7417,6 +7341,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 			cmap.erase(seq_it);
 			shard.hold_buffer_size--;
+            order5_total_hold_size_.fetch_sub(1, std::memory_order_release);
 		}
 		if (cmap.empty()) {
 			shard.hold_buffer.erase(map_it);
@@ -7468,7 +7393,18 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					order5_total_hold_size_.load(std::memory_order_relaxed));
 			}
 		}
-		if (ShouldFenceSessionGap(state, now_ns, effective_lease_ns)) {
+        uint64_t expiry_now_ns = now_ns;
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+        uint64_t advance_ns = 0;
+        const auto ready_count = std::count_if(ready.begin(), ready.end(), [&](const PendingBatch5& batch) {
+            return MakeSessionKey(batch.client_id, batch.session_epoch) == session_key;
+        });
+        if (!fault::Pause("classification.before_expiry_sweep",
+                {static_cast<uint64_t>(session_key >> 32), state.session_epoch, state.next_expected,
+                 static_cast<uint64_t>(ready_count), state.gap_since_ns}, &stop_threads_, &advance_ns)) return;
+        expiry_now_ns = advance_ns > UINT64_MAX - now_ns ? UINT64_MAX : now_ns + advance_ns;
+#endif
+        if (ShouldFenceSessionGap(state, expiry_now_ns, effective_lease_ns)) {
 			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 		}
 	}
@@ -7529,6 +7465,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 			cmap.erase(seq_it);
 			shard.hold_buffer_size--;
+            order5_total_hold_size_.fetch_sub(1, std::memory_order_release);
 		}
 		if (cmap.empty()) {
 			shard.hold_buffer.erase(map_it);
@@ -7539,6 +7476,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		}
 	}
 
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 	if (!per_client_terminalized_delta_epoch.empty()) {
 		absl::MutexLock lock(&per_client_mu_);
 		const uint64_t producing_epoch = cached_epoch_.load(std::memory_order_acquire);
@@ -8331,6 +8269,22 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	//     next epoch are still committed in sequence via ClientState5::next_expected.
 	//   - If seal() succeeds, we advance epoch_index_ to the successor, unblocking the
 	//     EpochSequencerThread busy-spin and triggering CommitEpoch immediately.
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+    // Deterministic batching uses the timer driver's reached seal barrier.
+    // This immutable opt-in exists only in fault builds; no production branch.
+    static const bool fault_disable_fast_seal = [] {
+        const char* value = std::getenv("EMBARCADERO_FAULT_DISABLE_FAST_SEAL");
+        return value && std::string(value) == "1";
+    }();
+    const bool fault_collection_cancelled = !fault::Pause("scanner.after_collect",
+            {pending.client_id, pending.session_epoch, pending.batch_seq,
+             epoch_index_.load(std::memory_order_acquire), pending.cached_pbr_absolute_index},
+            &stop_threads_);
+    if (fault_collection_cancelled) stop_threads_.store(true, std::memory_order_release);
+    // The batch is already collected. Finish this slot's bookkeeping before
+    // entering the normal drain and publishing scanner_shutdown_drained_.
+    if (!fault_disable_fast_seal && !fault_collection_cancelled)
+#endif
 	if (order5_steady_state_.load(std::memory_order_acquire)) {
 		const uint64_t pushed_epoch = epoch_index_.load(std::memory_order_acquire);
 		EpochBuffer5& pushed_buf = epoch_buffers_[pushed_epoch % 3];
@@ -8508,6 +8462,7 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
     const std::array<bool, NUM_MAX_BROKERS>& broker_seen_in_epoch,
     const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_cumulative,
     const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_pbr_index) {
+    if (order5_capacity_exhausted_.load(std::memory_order_acquire)) return;
 	if (batch_list.empty()) {
 		if (cv_max_cumulative && cv_max_pbr_index) {
 			FlushAccumulatedCV(*cv_max_cumulative, *cv_max_pbr_index);

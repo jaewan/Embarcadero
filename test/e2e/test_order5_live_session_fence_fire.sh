@@ -3,8 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BUILD_DIR="$PROJECT_ROOT/build"
+BUILD_DIR="${EMBARCADERO_TEST_BUILD_DIR:-$PROJECT_ROOT/build}"
 BIN_DIR="$BUILD_DIR/bin"
+BROKER_BIN="${EMBARCADERO_TEST_BROKER:-$BIN_DIR/embarlet}"
+CLIENT_BIN="${EMBARCADERO_TEST_CLIENT:-$BIN_DIR/throughput_test}"
 CONFIG_DIR="$PROJECT_ROOT/config"
 OUT_DIR="$BUILD_DIR/test_output/order5_live_session_fence_fire"
 LOCK_FILE="${EMBARCADERO_TESTBED_LOCK:-$(cd "$PROJECT_ROOT/.." && pwd)/testbed.lock}"
@@ -92,8 +94,8 @@ run_test_body() {
 	: > client_unaffected.log
 	rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 
-	[ -x "$BIN_DIR/embarlet" ] || fail "missing $BIN_DIR/embarlet"
-	[ -x "$BIN_DIR/throughput_test" ] || fail "missing $BIN_DIR/throughput_test"
+	[ -x "$BROKER_BIN" ] || fail "missing $BIN_DIR/embarlet"
+	[ -x "$CLIENT_BIN" ] || fail "missing $BIN_DIR/throughput_test"
 	[ -f "$CONFIG_DIR/embarcadero.yaml" ] || fail "missing broker config"
 	[ -f "$CONFIG_DIR/client.yaml" ] || fail "missing client config"
 
@@ -109,7 +111,7 @@ run_test_body() {
 		EMBARCADERO_TEST_ORDER5_CLAIMED_WAIT_MS="$CLAIMED_WAIT_MS" \
 		EMBARCADERO_TEST_ORDER5_STUCK_CLAIMED_BATCH_SEQ=0 \
 		EMBARCADERO_TEST_ORDER5_STUCK_CLAIMED_SESSION_EPOCH="$SESSION_EPOCH" \
-		"$BIN_DIR/embarlet" --config "$CONFIG_DIR/embarcadero.yaml" --head --EMBARCADERO \
+		"$BROKER_BIN" --config "$CONFIG_DIR/embarcadero.yaml" --head --EMBARCADERO \
 		> broker_0.log 2>&1 &
 	broker_pid="$!"
 	trap cleanup EXIT INT TERM
@@ -122,7 +124,7 @@ run_test_body() {
 		EMBARCADERO_NUM_BROKERS=1 \
 		EMBAR_USE_HUGETLB=0 \
 		EMBARCADERO_ACK_TIMEOUT_SEC=10 \
-		"$BIN_DIR/throughput_test" \
+		"$CLIENT_BIN" \
 			--config "$CONFIG_DIR/client.yaml" \
 			-n 1 -m "$MESSAGE_SIZE" -s "$FIRST_TOTAL_BYTES" -t 5 -o 5 -a 1 \
 			--sequencer EMBARCADERO --head_addr 127.0.0.1 -l 0 -r 0 \
@@ -201,7 +203,7 @@ run_test_body() {
 	env NUM_BROKERS=1 \
 		EMBARCADERO_NUM_BROKERS=1 \
 		EMBAR_USE_HUGETLB=0 \
-		"$BIN_DIR/throughput_test" \
+		"$CLIENT_BIN" \
 			--config "$CONFIG_DIR/client.yaml" \
 			-n 1 -m "$MESSAGE_SIZE" -s "$SECOND_TOTAL_BYTES" -t 5 -o 5 -a 1 \
 			--sequencer EMBARCADERO --head_addr 127.0.0.1 -l 0 -r 0 \

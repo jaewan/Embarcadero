@@ -6,6 +6,7 @@
 #include "common/ack_rf_policy.h"
 #include "common/configuration.h"
 #include "common/order_level.h"
+#include "common/support_contract.h"
 
 int main(int argc, char* argv[]) {
     // Initialize logging
@@ -53,13 +54,11 @@ int main(int argc, char* argv[]) {
     Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
     std::string config_file = result["config"].as<std::string>();
     
-    if (!config.loadFromFile(config_file)) {
-        LOG(WARNING) << "Failed to load configuration from " << config_file << ", using defaults";
-        // Continue with defaults - don't fail
-    } else {
-        VLOG(1) << "Configuration loaded successfully from " << config_file;
+    if (!config.loadFromFile(config_file) || !config.finalize()) {
+        LOG(ERROR) << "Invalid client configuration: " << config_file;
+        return EXIT_FAILURE;
     }
-    
+
     // Extract parameters (with config override capability)
     size_t message_size = result["size"].as<size_t>();
     size_t total_message_size = result["total_message_size"].as<size_t>();
@@ -84,41 +83,23 @@ int main(int argc, char* argv[]) {
     int ack_level = result["ack_level"].as<int>();
     SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
     FLAGS_v = result["log_level"].as<int>();
+#ifdef EMBARCADERO_CLIENT_NO_BASELINES
+    if (seq_type != heartbeat_system::SequencerType::EMBARCADERO) {
+        LOG(ERROR) << "This minimal client supports only Embarcadero; use the full client preset for baselines.";
+        return EXIT_FAILURE;
+    }
+#endif
 
-    if (seq_type == heartbeat_system::SequencerType::CORFU && order != Embarcadero::kOrderTotal) {
-        LOG(ERROR) << "Corfu supports only ORDER=2 in this implementation (got ORDER=" << order << ").";
-        return -1;
-    }
-    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && order != Embarcadero::kOrderTotal) {
-        LOG(ERROR) << "LazyLog baseline requires ORDER=2 (weak total order) in this implementation (got ORDER=" << order << ").";
-        return -1;
-    }
-    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && ack_level == 2 &&
-        replication_factor < Embarcadero::kMinReplicationFactorForAck2) {
-        LOG(ERROR) << "LazyLog ACK=2 requires RF>=2 (primary plus a media-durable payload replica).";
-        return -1;
-    }
-    if (seq_type == heartbeat_system::SequencerType::CORFU && ack_level == 2 &&
-        replication_factor < Embarcadero::kMinReplicationFactorForAck2) {
-        LOG(ERROR) << "Corfu ACK=2 requires RF>=2 (the CXL primary plus at least one "
-                   << "ordered media-durable replica).";
-        return -1;
-    }
-    if (seq_type == heartbeat_system::SequencerType::SCALOG && ack_level == 2 &&
-        (!std::getenv("SCALOG_CXL_MODE") || std::string(std::getenv("SCALOG_CXL_MODE")) != "1")) {
-        LOG(ERROR) << "Scalog ACK=2 requires SCALOG_CXL_MODE=1: only the CXL polling "
-                   << "path currently publishes the per-replica media-durable frontier.";
-        return -1;
+
+    const char* scalog_mode = std::getenv("SCALOG_CXL_MODE");
+    const auto supported = Embarcadero::ValidateSupportedMode(
+        {static_cast<Embarcadero::SupportedSequencer>(seq_type), order, ack_level, replication_factor},
+        scalog_mode && std::string(scalog_mode) == "1");
+    if (!supported.ok) {
+        LOG(ERROR) << supported.error;
+        return EXIT_FAILURE;
     }
 
-    {
-        const auto ack_rf = Embarcadero::ValidateAckReplicationPolicy(ack_level, replication_factor);
-        if (!ack_rf.ok) {
-            LOG(ERROR) << ack_rf.error;
-            return -1;
-        }
-    }
-    
     // Check if cgroup is properly set up
     if (result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()) {
         LOG(ERROR) << "CGroup core throttle is wrong";
@@ -186,6 +167,10 @@ int main(int argc, char* argv[]) {
             LOG(INFO) << "Running E2E Throughput";
             if (!ensure_topic_ready()) return EXIT_FAILURE;
             std::pair<double, double> bandwidths = E2EThroughputTest(result, topic);
+            if (!(bandwidths.first > 0.0) || !(bandwidths.second > 0.0)) {
+                LOG(ERROR) << "End-to-end transfer or correctness audit failed";
+                return EXIT_FAILURE;
+            }
             writer.SetPubResult(bandwidths.first);
             writer.SetE2EResult(bandwidths.second);
             break;

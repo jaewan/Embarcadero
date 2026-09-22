@@ -13,6 +13,7 @@ message SessionOpenAck {
 		OK = 0;
 		FENCED = 1;
 		EPOCH_STALE = 2;
+        RESOURCE_EXHAUSTED = 3;
 	}
 
 	// Inclusive last committed client batch_seq when has_committed_prefix is true.

@@ -4,7 +4,8 @@
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
-#include <getopt.h>
+#include <sstream>
+#include <limits>
 #include <glog/logging.h>
 #include <yaml-cpp/yaml.h>
 
@@ -18,28 +19,24 @@ const Configuration& GetConfig() {
 // Template specializations for environment variable parsing
 template<>
 std::optional<int> ConfigValue<int>::getEnvValue() const {
-    const char* env_val = std::getenv(env_var_.c_str());
-    if (env_val && *env_val != '\0') {
-        try {
-            return std::stoi(env_val);
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse env var " << env_var_ << ": " << e.what();
-        }
-    }
-    return std::nullopt;
+    const char* value = std::getenv(env_var_.c_str());
+    if (!value || !*value) return std::nullopt;
+    size_t used = 0;
+    const int result = std::stoi(value, &used);
+    if (used != std::string(value).size()) throw std::invalid_argument("invalid integer environment: " + env_var_);
+    return result;
 }
 
 template<>
 std::optional<size_t> ConfigValue<size_t>::getEnvValue() const {
-    const char* env_val = std::getenv(env_var_.c_str());
-    if (env_val && *env_val != '\0') {
-        try {
-            return std::stoull(env_val);
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse env var " << env_var_ << ": " << e.what();
-        }
-    }
-    return std::nullopt;
+    const char* value = std::getenv(env_var_.c_str());
+    if (!value || !*value) return std::nullopt;
+    if (*value == '-') throw std::invalid_argument("negative size environment: " + env_var_);
+    size_t used = 0;
+    const auto result = std::stoull(value, &used);
+    if (used != std::string(value).size() || result > std::numeric_limits<size_t>::max())
+        throw std::invalid_argument("invalid size environment: " + env_var_);
+    return static_cast<size_t>(result);
 }
 
 template<>
@@ -62,7 +59,7 @@ std::optional<bool> ConfigValue<bool>::getEnvValue() const {
         } else if (val == "false" || val == "0" || val == "no" || val == "off") {
             return false;
         }
-        LOG(WARNING) << "Invalid boolean value for env var " << env_var_ << ": " << env_val;
+        throw std::invalid_argument("invalid boolean environment: " + env_var_);
     }
     return std::nullopt;
 }
@@ -84,8 +81,20 @@ std::string Configuration::getRuntimeMode() const {
 }
 
 bool Configuration::loadFromFile(const std::string& filename) {
+    std::ifstream input(filename);
+    if (!input) { validation_errors_ = {"Cannot open configuration: " + filename}; return false; }
+    std::ostringstream content;
+    content << input.rdbuf();
+    return loadFromString(content.str());
+}
+
+bool Configuration::loadFromString(const std::string& yaml_content) {
+    if (frozen_) { LOG(ERROR) << "Configuration is frozen"; return false; }
+    const auto previous = config_;
     try {
-        YAML::Node yaml = YAML::LoadFile(filename);
+        YAML::Node yaml = YAML::Load(yaml_content);
+        if (!yaml.IsMap() || (!yaml["embarcadero"] && !yaml["client"]))
+            throw std::invalid_argument("expected an embarcadero or client mapping");
         
         if (yaml["embarcadero"]) {
             auto root = yaml["embarcadero"];
@@ -111,7 +120,10 @@ bool Configuration::loadFromFile(const std::string& filename) {
             if (root["cxl"]) {
                 auto cxl = root["cxl"];
                 if (cxl["size"]) config_.cxl.size.set(cxl["size"].as<size_t>());
-                if (cxl["emulation_size"]) config_.cxl.emulation_size.set(cxl["emulation_size"].as<size_t>());
+                if (cxl["emulation_size"]) {
+                    config_.cxl.emulation_size.set(cxl["emulation_size"].as<size_t>());
+                    LOG(WARNING) << "cxl.emulation_size is deprecated and ignored; cxl.size controls all backends";
+                }
                 if (cxl["device_path"]) config_.cxl.device_path.set(cxl["device_path"].as<std::string>());
                 if (cxl["numa_node"]) config_.cxl.numa_node.set(cxl["numa_node"].as<int>());
             }
@@ -315,88 +327,129 @@ bool Configuration::loadFromFile(const std::string& filename) {
             }
         }
         
-        return validateConfig();
-    } catch (const YAML::Exception& e) {
-        LOG(ERROR) << "Failed to parse configuration file: " << e.what();
+        if (validateConfig()) return true;
+        config_ = previous;
         return false;
-    }
-}
-
-bool Configuration::loadFromString(const std::string& yaml_content) {
-    try {
-        YAML::Node yaml = YAML::Load(yaml_content);
-        // Same parsing logic as loadFromFile
-        // ... (implementation identical to loadFromFile but using the string)
-        return validateConfig();
-    } catch (const YAML::Exception& e) {
-        LOG(ERROR) << "Failed to parse configuration string: " << e.what();
+    } catch (const std::exception& e) {
+        config_ = previous;
+        validation_errors_ = {e.what()};
+        LOG(ERROR) << "Failed to parse configuration: " << e.what();
         return false;
     }
 }
 
 void Configuration::overrideFromCommandLine(int argc, char* argv[]) {
-    static struct option long_options[] = {
-        {"broker-port", required_argument, 0, 'p'},
-        {"heartbeat-interval", required_argument, 0, 'h'},
-        {"cxl-size", required_argument, 0, 'c'},
-        {"batch-size", required_argument, 0, 'b'},
-        {"network-threads", required_argument, 0, 'n'},
-        {"network_threads", required_argument, 0, 'n'},
-        // Accept common flags used by the app so getopt_long doesn't error
-        {"head", no_argument, 0, 0},
-        {"follower", required_argument, 0, 0},
-        {"scalog", no_argument, 0, 0},
-        {"SCALOG", no_argument, 0, 0},
-        {"corfu", no_argument, 0, 0},
-        {"CORFU", no_argument, 0, 0},
-        {"embarcadero", no_argument, 0, 0},
-        {"EMBARCADERO", no_argument, 0, 0},
-        {"emul", no_argument, 0, 0},
-        {"run_cgroup", required_argument, 0, 0},
-        {"replicate_to_disk", no_argument, 0, 0},
-        {"max-topics", required_argument, 0, 't'},
-        {"config", required_argument, 0, 'f'},
-        {0, 0, 0, 0}
-    };
-    
-    int option_index = 0;
-    int c;
-    // Suppress getopt_long default error messages for unknown options
-    opterr = 0;
-    // Reset getopt state in case other parsers were used earlier
-    optind = 1;
-    
-    while ((c = getopt_long(argc, argv, "p:h:c:b:n:t:f:", long_options, &option_index)) != -1) {
-        switch (c) {
-            case 'p':
-                config_.broker.port.set(std::stoi(optarg));
-                break;
-            case 'h':
-                config_.broker.heartbeat_interval.set(std::stoi(optarg));
-                break;
-            case 'c':
-                config_.cxl.size.set(std::stoull(optarg));
-                break;
-            case 'b':
-                config_.storage.batch_size.set(std::stoull(optarg));
-                break;
-            case 'n':
-                config_.network.io_threads.set(std::stoi(optarg));
-                break;
-            case 't':
-                config_.storage.max_topics.set(std::stoi(optarg));
-                break;
-            case 'f':
-                loadFromFile(optarg);
-                break;
-            case 0:
-                // Known app flags we intentionally ignore here (handled elsewhere)
-                break;
-            default:
-                // Ignore unknown flags to avoid noisy logs; app parser handles them
-                break;
+    if (frozen_) throw std::logic_error("configuration is frozen");
+    // The application owns short flags. Never reinterpret -c (cgroup) as size,
+    // or re-load --config after an earlier explicit override.
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        const auto eq = arg.find('=');
+        const auto key = arg.substr(0, eq);
+        if (key != "--broker-port" && key != "--heartbeat-interval" &&
+            key != "--cxl-size" && key != "--batch-size" &&
+            key != "--network-threads" && key != "--network_threads" && key != "--max-topics") continue;
+        std::string value;
+        if (eq != std::string::npos) value = arg.substr(eq + 1);
+        else if (i + 1 < argc) value = argv[++i];
+        else throw std::invalid_argument("missing value for " + key);
+        size_t used = 0;
+        if (value.empty() || value.front() == '-') throw std::invalid_argument("invalid value for " + key);
+        const auto n = std::stoull(value, &used);
+        if (used != value.size()) throw std::invalid_argument("invalid value for " + key);
+        if (key == "--cxl-size") config_.cxl.size.setOverride(n);
+        else if (key == "--batch-size") config_.storage.batch_size.setOverride(n);
+        else {
+            if (n > static_cast<unsigned long long>(std::numeric_limits<int>::max()))
+                throw std::invalid_argument("value out of range for " + key);
+            if (key == "--broker-port") config_.broker.port.setOverride(n);
+            else if (key == "--heartbeat-interval") config_.broker.heartbeat_interval.setOverride(n);
+            else if (key == "--max-topics") config_.storage.max_topics.setOverride(n);
+            else config_.network.io_threads.setOverride(n);
         }
     }
+}
+
+bool Configuration::finalize() {
+    if (frozen_) return true;
+    if (!validate()) return false;
+    config_.broker.broker_port.freeze();
+    config_.broker.cgroup_core.freeze();
+    config_.broker.heartbeat_interval.freeze();
+    config_.broker.max_brokers.freeze();
+    config_.broker.port.freeze();
+    config_.client.network.connect_timeout_ms.freeze();
+    config_.client.network.recv_timeout_ms.freeze();
+    config_.client.network.send_timeout_ms.freeze();
+    config_.client.performance.enable_publisher_pipeline_profile.freeze();
+    config_.client.performance.numa_bind.freeze();
+    config_.client.performance.use_hugepages.freeze();
+    config_.client.performance.zero_copy.freeze();
+    config_.client.publisher.batch_size_kb.freeze();
+    config_.client.publisher.buffer_size_mb.freeze();
+    config_.client.publisher.threads_per_broker.freeze();
+    config_.client.runtime.ack_drain_ms_failure.freeze();
+    config_.client.runtime.ack_drain_ms_latency.freeze();
+    config_.client.runtime.ack_drain_ms_throughput.freeze();
+    config_.client.runtime.ack_timeout_sec_failure.freeze();
+    config_.client.runtime.ack_timeout_sec_latency.freeze();
+    config_.client.runtime.ack_timeout_sec_throughput.freeze();
+    config_.client.runtime.epoll_wait_writable_ms_failure.freeze();
+    config_.client.runtime.epoll_wait_writable_ms_latency.freeze();
+    config_.client.runtime.epoll_wait_writable_ms_throughput.freeze();
+    config_.client.runtime.header_send_timeout_ms_failure.freeze();
+    config_.client.runtime.header_send_timeout_ms_latency.freeze();
+    config_.client.runtime.header_send_timeout_ms_throughput.freeze();
+    config_.client.runtime.mode.freeze();
+    config_.client.runtime.session_rto_min_ms_failure.freeze();
+    config_.client.runtime.session_rto_min_ms_latency.freeze();
+    config_.client.runtime.session_rto_min_ms_throughput.freeze();
+    config_.client.runtime.socket_recv_buffer_bytes_failure.freeze();
+    config_.client.runtime.socket_recv_buffer_bytes_latency.freeze();
+    config_.client.runtime.socket_recv_buffer_bytes_throughput.freeze();
+    config_.client.runtime.socket_send_buffer_bytes_failure.freeze();
+    config_.client.runtime.socket_send_buffer_bytes_latency.freeze();
+    config_.client.runtime.socket_send_buffer_bytes_throughput.freeze();
+    config_.client.runtime.tcp_user_timeout_ms_failure.freeze();
+    config_.client.runtime.tcp_user_timeout_ms_latency.freeze();
+    config_.client.runtime.tcp_user_timeout_ms_throughput.freeze();
+    config_.client.subscriber.buffer_size_mb.freeze();
+    config_.client.subscriber.connections_per_broker.freeze();
+    config_.cluster.sequencer_broker_id.freeze();
+    config_.corfu.replication_port.freeze();
+    config_.corfu.sequencer_ip.freeze();
+    config_.corfu.sequencer_port.freeze();
+    config_.cxl.device_path.freeze();
+    config_.cxl.emulation_size.freeze();
+    config_.cxl.numa_node.freeze();
+    config_.cxl.size.freeze();
+    config_.lazylog.local_cut_interval.freeze();
+    config_.lazylog.replication_port.freeze();
+    config_.lazylog.sequencer_ip.freeze();
+    config_.lazylog.sequencer_port.freeze();
+    config_.network.disk_io_threads.freeze();
+    config_.network.enable_publish_pipeline_profile.freeze();
+    config_.network.io_threads.freeze();
+    config_.network.pbr_high_watermark_pct.freeze();
+    config_.network.pbr_low_watermark_pct.freeze();
+    config_.network.sub_connections.freeze();
+    config_.network.zero_copy_send_limit.freeze();
+    config_.platform.is_amd.freeze();
+    config_.platform.is_intel.freeze();
+    config_.scalog.local_cut_interval.freeze();
+    config_.scalog.replication_port.freeze();
+    config_.scalog.sequencer_ip.freeze();
+    config_.scalog.sequencer_port.freeze();
+    config_.storage.batch_headers_size.freeze();
+    config_.storage.batch_size.freeze();
+    config_.storage.max_topics.freeze();
+    config_.storage.num_disks.freeze();
+    config_.storage.segment_size.freeze();
+    config_.storage.topic_name_size.freeze();
+    config_.version.major.freeze();
+    config_.version.minor.freeze();
+    frozen_ = true;
+    return true;
 }
 
 bool Configuration::validate() const {
@@ -416,6 +469,28 @@ bool Configuration::validate() const {
         validation_errors_.push_back("Batch size cannot exceed segment size");
     }
     
+    const auto segment = config_.storage.segment_size.get();
+    const auto batch = config_.storage.batch_size.get();
+    const auto ring = config_.storage.batch_headers_size.get();
+    if (segment <= 4096 || segment % 64 != 0 || batch == 0 || batch > segment - std::min(segment, size_t{4096}))
+        validation_errors_.push_back("Segment must be 64-byte aligned with room for its initial 4096-byte prefix and a nonzero batch");
+    if (ring < 2 * 128 || ring % 128 != 0)
+        validation_errors_.push_back("PBR must contain at least two complete 128-byte entries");
+    if (config_.broker.max_brokers.get() < 1 || config_.broker.max_brokers.get() > 32)
+        validation_errors_.push_back("max_brokers must be in [1,32]");
+    if (config_.cluster.sequencer_broker_id.get() < 0 ||
+        config_.cluster.sequencer_broker_id.get() >= config_.broker.max_brokers.get())
+        validation_errors_.push_back("sequencer_broker_id must be a configured broker");
+    if (config_.broker.broker_port.get() < 1024 || config_.broker.broker_port.get() > 65535 ||
+        config_.broker.port.get() > 65535 - config_.broker.max_brokers.get() + 1)
+        validation_errors_.push_back("Configured broker ports are out of range");
+    if (config_.storage.num_disks.get() < 1 || config_.broker.heartbeat_interval.get() < 1)
+        validation_errors_.push_back("Disk count and heartbeat interval must be positive");
+    const auto high = config_.network.pbr_high_watermark_pct.get();
+    const auto low = config_.network.pbr_low_watermark_pct.get();
+    if (low < 0 || low >= high || high > 100)
+        validation_errors_.push_back("PBR watermarks require 0 <= low < high <= 100");
+
     // Validate thread counts
     if (config_.network.io_threads.get() < 1) {
         validation_errors_.push_back("Network IO threads must be at least 1");
@@ -434,6 +509,12 @@ bool Configuration::validate() const {
         validation_errors_.push_back("Topic name size must be between 1 and 255");
     }
     
+    std::vector<int> ids = config_.cluster.data_broker_ids;
+    std::sort(ids.begin(), ids.end());
+    if (std::adjacent_find(ids.begin(), ids.end()) != ids.end() ||
+        std::any_of(ids.begin(), ids.end(), [&](int id) { return id < 0 || id >= config_.broker.max_brokers.get(); }))
+        validation_errors_.push_back("data_broker_ids must be distinct configured broker ids");
+
     // Platform validation
     if (config_.platform.is_intel.get() && config_.platform.is_amd.get()) {
         validation_errors_.push_back("Cannot be both Intel and AMD platform");

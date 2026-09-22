@@ -37,7 +37,7 @@ class ScalogReplicationRpcTest : public ::testing::Test {
 
 TEST_F(ScalogReplicationRpcTest, ReplyFollowsDurableWrite) {
   Scalog::ScalogReplicationManager server(
-      /*broker_id=*/0, /*log_to_memory=*/true, "127.0.0.1", std::to_string(kPort),
+      /*broker_id=*/0, /*log_to_memory=*/false, "127.0.0.1", std::to_string(kPort),
       log_path_);
   Scalog::ScalogReplicationClient client("TestTopic", 2, "127.0.0.1", 0, kPort);
   ASSERT_TRUE(client.Connect(2));
@@ -54,7 +54,7 @@ TEST_F(ScalogReplicationRpcTest, ReplyFollowsDurableWrite) {
 
 TEST_F(ScalogReplicationRpcTest, SyncFailureFailsClosed) {
   Scalog::ScalogReplicationManager server(
-      /*broker_id=*/0, /*log_to_memory=*/true, "127.0.0.1", std::to_string(kPort),
+      /*broker_id=*/0, /*log_to_memory=*/false, "127.0.0.1", std::to_string(kPort),
       log_path_);
   Scalog::ScalogReplicationClient client("TestTopic", 2, "127.0.0.1", 0, kPort);
   ASSERT_TRUE(client.Connect(2));
@@ -66,6 +66,19 @@ TEST_F(ScalogReplicationRpcTest, SyncFailureFailsClosed) {
 
   // A subsequent redrive is admitted only after native fdatasync succeeds.
   EXPECT_TRUE(client.ReplicateData(0, payload.size(), 4, payload.data(), 0));
+}
+
+TEST_F(ScalogReplicationRpcTest, MemorySinkRejectsDurableRpcPromptly) {
+  Scalog::ScalogReplicationManager server(
+      /*broker_id=*/0, /*log_to_memory=*/true, "127.0.0.1", std::to_string(kPort),
+      log_path_);
+  Scalog::ScalogReplicationClient client("TestTopic", 2, "127.0.0.1", 0, kPort);
+  ASSERT_TRUE(client.Connect(2));
+  std::vector<char> payload(4096, 'm');
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(client.ReplicateData(0, payload.size(), 4, payload.data(), 0));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+  EXPECT_FALSE(std::filesystem::exists(log_path_));
 }
 
 }  // namespace

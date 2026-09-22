@@ -2,6 +2,8 @@
 #define EMBARCADERO_CONFIGURATION_H_
 
 #include <atomic>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <memory>
 #include <optional>
@@ -23,46 +25,50 @@ public:
         : value_(default_value), env_var_(env_var) {}
     // std::atomic member deletes implicit copies; restore them (fresh cache).
     ConfigValue(const ConfigValue& other)
-        : value_(other.value_), env_var_(other.env_var_) {}
+        : value_(other.value_), env_var_(other.env_var_), override_(other.override_) {}
     ConfigValue& operator=(const ConfigValue& other) {
+        if (frozen_) throw std::logic_error("configuration is frozen");
         value_ = other.value_;
         env_var_ = other.env_var_;
+        override_ = other.override_;
         resolved_.store(false, std::memory_order_release);
         return *this;
     }
 
-    // [[GETENV_MEMO 2026-07-12]] The env lookup is resolved ONCE and cached.
-    // Previously every get() called getenv() (a linear scan of environ with
-    // strncmp): the config macros in config.h.in hide these calls, and e.g.
-    // BATCHHEADERS_SIZE appears 14x inside BrokerScannerWorker5's poll loop —
-    // perf showed 35% of the head broker's cycles in getEnvValue()/getenv,
-    // pacing every client's ORDER=5 ordered frontier (~3.4 GB/s ACK ceiling).
-    // Env vars are process-start configuration; mid-run changes were never
-    // supported, so memoization preserves semantics.
+    // Fast reads are immutable after startup. The slow path also supports safe
+    // concurrent first access in library users that have not called finalize().
     T get() const {
         if (!resolved_.load(std::memory_order_acquire)) {
-            std::optional<T> env_value;
-            if (!env_var_.empty()) {
-                env_value = getEnvValue();
+            std::lock_guard<std::mutex> lock(resolve_mutex_);
+            if (!resolved_.load(std::memory_order_relaxed)) {
+                const auto env = (!override_ && !env_var_.empty()) ? getEnvValue() : std::nullopt;
+                cached_ = env ? *env : value_;
+                resolved_.store(true, std::memory_order_release);
             }
-            // Benign race: concurrent first-callers compute identical results.
-            cached_ = env_value.has_value() ? env_value.value() : value_;
-            resolved_.store(true, std::memory_order_release);
         }
         return cached_;
     }
 
+    // Mutation is a startup-only operation, before worker creation.
     void set(T value) {
-        value_ = value;
-        // Re-resolve on next get() so yaml loading (set()) still composes
-        // with env override precedence.
+        if (frozen_) throw std::logic_error("configuration is frozen");
+        value_ = std::move(value);
+        override_ = false;
         resolved_.store(false, std::memory_order_release);
     }
+    void setOverride(T value) {
+        set(std::move(value));
+        override_ = true;
+    }
+    void freeze() { (void)get(); frozen_ = true; }
     const std::string& env_var() const { return env_var_; }
 
 private:
     T value_;
     std::string env_var_;
+    bool override_{false};
+    bool frozen_{false};
+    mutable std::mutex resolve_mutex_;
     mutable T cached_{};
     mutable std::atomic<bool> resolved_{false};
 
@@ -90,7 +96,7 @@ struct EmbarcaderoConfig {
 
     // CXL memory configuration
     struct CXL {
-        ConfigValue<size_t> size{1UL << 35, "EMBARCADERO_CXL_SIZE"};
+        ConfigValue<size_t> size{1UL << 36, "EMBARCADERO_CXL_SIZE"};
         ConfigValue<size_t> emulation_size{1UL << 35, "EMBARCADERO_CXL_EMUL_SIZE"};
         ConfigValue<std::string> device_path{"/dev/dax0.0", "EMBARCADERO_CXL_DEVICE"};
         ConfigValue<int> numa_node{2, "EMBARCADERO_CXL_NUMA_NODE"};
@@ -239,7 +245,9 @@ public:
     
     // Get the configuration
     const EmbarcaderoConfig& config() const { return config_; }
-    EmbarcaderoConfig& config() { return config_; }
+    // No mutable configuration escapes the manager.
+    bool finalize();
+    bool frozen() const { return frozen_; }
 
     // Helper methods for common access patterns
     int getBrokerPort() const { return config_.broker.port.get(); }
@@ -264,6 +272,7 @@ private:
     Configuration(const Configuration&) = delete;
     Configuration& operator=(const Configuration&) = delete;
 
+    bool frozen_{false};
     EmbarcaderoConfig config_;
     mutable std::vector<std::string> validation_errors_;
 
