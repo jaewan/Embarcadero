@@ -147,6 +147,9 @@ struct SubscriberTestPeer {
 		absl::MutexLock lock(&sub.owned_message_pool_mutex_);
 		return sub.allocated_owned_messages_;
 	}
+	static void* ConsumeSingle(Subscriber& sub, int timeout_ms) {
+		return sub.ConsumeOrdered(timeout_ms);
+	}
 };
 
 namespace {
@@ -687,6 +690,32 @@ TEST(Order5DeliveryAudit, CancellationAndShutdownInterruptLongAuditDeadline) {
         EXPECT_EQ(audit.wait_for(200ms), std::future_status::ready);
         EXPECT_FALSE(audit.get());
     }
+    if (had_previous) setenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US", saved.c_str(), 1);
+    else unsetenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US");
+}
+
+TEST(Order5DeliveryAudit, OrderedWaitHonorsDeadlineAndWakesOnPublishedMessage) {
+    using namespace std::chrono_literals;
+    const char* previous = std::getenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US");
+    const std::string saved = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+    setenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US", "1000000", 1);
+    auto sub = BoundedSubscriber({1 << 20, 64});
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(SubscriberTestPeer::ConsumeSingle(*sub, 2), nullptr);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 250ms);
+
+    SubscriberTestPeer::StreamParseState state;
+    const auto bytes = IndexedAuditFrames(0, 1);
+    std::thread producer([&] {
+        std::this_thread::sleep_for(10ms);
+        SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+    });
+    std::vector<Subscriber::OrderedMessageView> views;
+    const auto wait_started = std::chrono::steady_clock::now();
+    EXPECT_EQ(sub->ConsumeOrderedBatch(&views, 1, 1000), 1u);
+    EXPECT_LT(std::chrono::steady_clock::now() - wait_started, 500ms);
+    producer.join();
     if (had_previous) setenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US", saved.c_str(), 1);
     else unsetenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US");
 }

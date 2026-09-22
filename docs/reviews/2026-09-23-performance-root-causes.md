@@ -14,8 +14,9 @@ The source11 client was identical for both versions in the original comparison.
 Its large absolute cost and audit-schedule sensitivity therefore do not, by
 themselves, establish a broker-version treatment effect.
 
-Production code and the original frozen binaries were not changed. Diagnostic
-binaries preserve safety checks and have separate source/build attestations.
+Production code and the original frozen binaries were not changed during this investigation. Diagnostic
+binaries preserve safety checks and have separate source/build attestations. Subsequent implementation
+and qualification are recorded in [Performance fixes](2026-09-23-performance-fixes.md).
 
 The workload is one broker, ORDER5/ACK1/RF0, 2 GiB of 4096-byte indexed messages,
 2 MiB batches, 64 GiB fresh DRAM emulation, 4 GiB segments, client CPUs 0–31/node 0,

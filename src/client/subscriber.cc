@@ -343,6 +343,7 @@ void Subscriber::RecycleOwnedMessage(OwnedMessage* msg) noexcept {
 	}
 }
 
+
 // Helper struct to store header data for validation (supports both V1 and V2)
 struct HeaderValidationData {
 	size_t total_order;
@@ -400,7 +401,10 @@ int64_t ReceiverCvWaitUs() {
 }
 
 int64_t ConsumeOrderedWaitUs() {
-	return ResolveInt64Env("EMBARCADERO_CONSUME_ORDERED_WAIT_US", 50, 1, 1000000);
+	// Contiguous ordered data signals consume_cv_ while holding consume_mutex_.
+	// Keep a bounded fallback for terminal/cancellation paths that do not share
+	// that lock, without polling an idle stream every 50 microseconds.
+	return ResolveInt64Env("EMBARCADERO_CONSUME_ORDERED_WAIT_US", 20000, 1, 1000000);
 }
 
 size_t SubscriberRecvChunkBytes(bool measure_latency, size_t broker_count) {
@@ -3417,8 +3421,7 @@ size_t Subscriber::TryPopOrderedMessagesLocked(
 }
 
 void* Subscriber::ConsumeOrdered(int timeout_ms) {
-	auto start_time = std::chrono::steady_clock::now();
-	auto timeout = std::chrono::milliseconds(timeout_ms);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 	const int64_t wait_us = ConsumeOrderedWaitUs();
 
 	{
@@ -3426,14 +3429,20 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 		last_returned_.reset();
 	}
 
-	while (std::chrono::steady_clock::now() - start_time < timeout &&
+	while (std::chrono::steady_clock::now() < deadline &&
 	       !shutdown_.load(std::memory_order_acquire) &&
 	       !retention_exhausted_.load(std::memory_order_acquire)) {
 		absl::MutexLock lock(&consume_mutex_);
 		if (void* ret = TryPopOrderedMessageLocked()) {
 			return ret;
 		}
-		consume_cv_.WaitWithTimeout(&consume_mutex_, absl::Microseconds(wait_us));
+		if (shutdown_.load(std::memory_order_acquire) ||
+		    retention_exhausted_.load(std::memory_order_acquire)) break;
+		const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			deadline - std::chrono::steady_clock::now()).count();
+		if (remaining <= 0) break;
+		consume_cv_.WaitWithTimeout(&consume_mutex_,
+			absl::Nanoseconds(std::min<int64_t>(remaining, wait_us * 1000)));
 		if (void* ret = TryPopOrderedMessageLocked()) {
 			return ret;
 		}
