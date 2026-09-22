@@ -24,23 +24,54 @@ sys.path.insert(0, str(ROOT / "tools"))
 import dev_cluster as dev
 from fault_control import FaultControl
 
-CASES = ("control", "fragmented_open", "truncated_control", "mismatched_client",
+CORE_CASES = ("control", "fragmented_open", "truncated_control", "mismatched_client",
          "incomplete_payload", "malformed_body", "shutdown_partial_handshake",
          "shutdown_ack_connect", "shutdown_queue", "fence_before_commit", "commit_before_fence",
          "fence_empty_prefix", "ack_publication_lag", "shutdown_replication_token", "session_capacity",
          "goi_capacity", "blog_capacity", "rollover_retention")
-SESSION_CASES = {"fence_before_commit": 6, "commit_before_fence": 8, "fence_empty_prefix": 2}
+SESSION_CASES = {"fence_before_commit": 8, "commit_before_fence": 8, "fence_empty_prefix": 2}
 STORAGE_CASES = ("goi_capacity", "blog_capacity", "rollover_retention")
-# These require the next hook-enabled binary snapshot. Select them explicitly
-# while the existing eighteen-case campaign is running against its frozen build.
 CLIENT_EXTENSIONS = ("ack_hwm_withheld", "session_reopen_resubmit")
+CASES = CORE_CASES + CLIENT_EXTENSIONS
 REAL_CLIENT_CASES = ("ack_publication_lag",) + CLIENT_EXTENSIONS
+ACTIVE_TIMEOUT_SECONDS = 60
+PAYLOAD_UPPER_BOUNDS = {
+    "control": 24576, "fragmented_open": 24576, "truncated_control": 24576,
+    "mismatched_client": 24576, "incomplete_payload": 32768, "malformed_body": 32768,
+    "shutdown_partial_handshake": 0, "shutdown_ack_connect": 0, "shutdown_queue": 0,
+    "fence_before_commit": 49152, "commit_before_fence": 40960, "fence_empty_prefix": 16384,
+    "ack_publication_lag": 8192, "ack_hwm_withheld": 8192, "session_reopen_resubmit": 65536,
+    "shutdown_replication_token": 8192, "session_capacity": 16384, "goi_capacity": 24576,
+    "blog_capacity": 263454720, "rollover_retention": 670433280,
+}
 HOOKS = {
     "fragmented_open": ("ingress.session_prefix.partial",),
     "shutdown_partial_handshake": ("ingress.handshake.partial",),
     "shutdown_ack_connect": ("ack.connect.wait",),
     "shutdown_queue": ("queue.worker_paused", "queue.push.blocked"),
 }
+
+
+class ActiveDeadline:
+    """Interrupt blocking Python controller waits; owned cleanup remains separate."""
+    def __init__(self, seconds):
+        if signal.getitimer(signal.ITIMER_REAL)[0] != 0:
+            raise dev.RunError("fault runner cannot replace an existing real-time deadline")
+        self.previous_handler = signal.getsignal(signal.SIGALRM)
+        self.deadline = time.monotonic() + seconds
+        self.closed = False
+
+        def expired(_number, _frame):
+            raise dev.RunError(f"fault case exceeded its {seconds}-second active deadline")
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+
+    def close(self):
+        if not self.closed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self.previous_handler)
+            self.closed = True
 
 
 class DriverControl:
@@ -71,16 +102,35 @@ class DriverControl:
         self.child.close()
 
 
+def verify_executed_binary(process, declared_path, expected_digest, evidence):
+    """Bind a manifest digest to the executable inode actually mapped by a child.
+
+    A build can replace the pathname between preflight and exec. Reading the
+    procfs link at a controlled barrier checks that child's executable instead.
+    """
+    executable = Path(f"/proc/{process.pid}/exe")
+    evidence.update(pid=process.pid, declared_path=str(declared_path),
+                    declared_sha256=expected_digest, observed_path=os.readlink(executable),
+                    observed_sha256=dev.binary_digest(executable),
+                    observed_monotonic=time.monotonic())
+    if evidence["observed_sha256"] != expected_digest:
+        raise dev.RunError(f"executed binary differs from preflight: {declared_path}; "
+                           f"expected {expected_digest}, observed {evidence['observed_sha256']}")
+
+
 def validate_result(run_dir, case):
     if case == "ack_hwm_withheld":
         text = (run_dir / "driver.log").read_text(errors="replace")
-        failures = re.findall(r"\[Publisher ACK Failure\]: Did not receive ACKs for all messages\. "
-            r"normalized_received=(\d+) raw_received=(\d+) target=(\d+) short=(\d+)", text)
-        if len(failures) != 1 or tuple(map(int, failures[0])) != (0, 0, 2, 2):
-            raise dev.RunError("withheld HWM did not produce the exact explicit ACK failure")
+        # Poll's timeout branch returns before its later shortfall diagnostic.
+        # Require this exact real timeout, not any failure/shortfall marker.
+        failures = re.findall(r"\[Publisher ACK Timeout\]: Waited (\d+) seconds for ACKs, "
+            r"normalized_received=(\d+) raw_received=(\d+) out of (\d+) \(timeout=(\d+)s\)", text)
+        if len(failures) != 1 or tuple(map(int, failures[0])) != (2, 0, 0, 2, 2):
+            raise dev.RunError("withheld HWM did not produce the exact two-second ACK timeout")
         if "[ACK_VERIFY]" in text or "[ORDERED_DELIVERY_AUDIT] status=passed" in text:
             raise dev.RunError("client falsely completed while the authoritative HWM was withheld")
-        return {"expected_exit_code": 1, "scope": "real publisher Poll rejects a withheld authoritative HWM; no successful delivery audit"}
+        return {"expected_exit_code": 1, "ack_timeout_seconds": 2,
+                "scope": "real publisher Poll times out with the authoritative two-message HWM withheld; no successful delivery audit"}
     if case == "session_reopen_resubmit":
         text = (run_dir / "driver.log").read_text(errors="replace")
         audits = re.findall(r"\[ORDERED_DELIVERY_AUDIT\] status=passed messages=(\d+) expected=(\d+) "
@@ -89,7 +139,7 @@ def validate_result(run_dir, case):
             raise dev.RunError("reopened publisher did not deliver exactly four original indexed application messages")
         resubmits = re.findall(r"\[SESSION_REOPEN_RESUBMIT\] old_epoch=1 new_epoch=2 committed_batch_seq=\d+ "
                               r"suffix_batches=(\d+) requeued_pool_batches=(\d+) direct_resubmit_batches=(\d+)", text)
-        if (len(resubmits) != 1 or int(resubmits[0][0]) <= 0 or
+        if (len(resubmits) != 1 or not 0 < int(resubmits[0][0]) <= 4 or
             int(resubmits[0][1]) + int(resubmits[0][2]) != int(resubmits[0][0]) or
             text.count("[SESSION_FENCED_OBSERVED]") != 1):
             raise dev.RunError("publisher did not perform exactly one complete epoch1-to-2 suffix resubmission")
@@ -159,7 +209,8 @@ def arm_broker_hooks(control, case):
         empty = case == "fence_empty_prefix"
         return {"expiry": control.arm("classification.before_expiry_sweep", client=1001, epoch=1,
                                      batch=0 if empty else 3, value=1000000000000),
-                "scanner": control.arm("scanner.after_collect", client=1001, epoch=1, batch=1 if empty else 4)}
+                "scanner": control.arm("scanner.after_collect", client=1002 if case == "fence_before_commit" else 1001,
+                    epoch=1, batch=1 if case == "fence_before_commit" or empty else 4)}
     return {name: control.arm(name) for name in HOOKS.get(case, ())}
 
 
@@ -203,8 +254,10 @@ def ack_schedule(control, ready=True):
     return {"authoritative_hwm": hwm, "poll_snapshot": snapshot, "retirement": retirement}
 
 
-def withheld_ack_schedule(control):
+def withheld_ack_schedule(control, observe=None):
     control.ready(20)
+    if observe:
+        observe()
     identity = control.arm("ack.before_authoritative_hwm", batch=2)
     control.start()
     hit = control.hit(identity)
@@ -333,22 +386,27 @@ def run_case(args, case, hardware):
     manifest = {"schema": 1, "profile": "production-fault-dram", "case": case, "status": "preflight",
                 "backend": "dram-emulation", "cxl_evidence": False, "performance_evidence": False,
                 "region_bytes": dev.REGION_BYTES, "segment_bytes": dev.SEGMENT_BYTES,
-                "application_payload_upper_bound_bytes": 768 * dev.MIB if case in STORAGE_CASES else 32768,
+                "application_payload_upper_bound_bytes": PAYLOAD_UPPER_BOUNDS[case],
+                "payload_bound_scope": "publisher ingress application payload attempts, including rejected and resubmitted bytes; excludes subscriber replay and protocol headers",
                 "brokers": brokers,
                 "order": 5, "ack": 2 if replication else 1, "replication_factor": 3 if replication else 0,
                 "persistence": "none", "replication_sink": "memory-copy",
                 "expected_hooks": HOOKS.get(case, ()), "shared_memory": str(shm_path),
                 "started_wall": time.time(), "started_monotonic": time.monotonic(),
                 "hardware": hardware, "shutdown_deadline_seconds": 15,
+                "active_deadline_seconds": ACTIVE_TIMEOUT_SECONDS,
                 "limitations": ["local DRAM correctness experiment; no CXL, persistence, or performance claim",
                                 "fixed ports serialize per user; unrelated launchers do not honor this lock"]}
-    owned = control = driver_control = client_control = None
+    owned = control = driver_control = client_control = active_timer = None
     controls = []
     processes = []
     arms = []
     identity = None
     markers = []
     passed = False
+    if case == "session_reopen_resubmit":
+        manifest["unique_application_payload_bytes"] = 16384
+        manifest["transmitted_payload_bound_reason"] = "four unique messages; exactly one bounded suffix resubmission, zero timer retransmissions; 64 KiB conservative cap"
     try:
         build = args.build_dir.resolve()
         require_fault_build(build)
@@ -427,6 +485,12 @@ def run_case(args, case, hardware):
             owned.start_wall = time.time()
             startup_deadline = time.monotonic() + args.startup_timeout
             manifest["pids"], manifest["fault_environment"], manifest["broker_placement"] = {}, {}, {}
+            manifest["executed_binaries"] = {}
+
+            def capture_binary_identity(name, child, binary):
+                evidence = manifest["executed_binaries"].setdefault(name, {})
+                verify_executed_binary(child, binary, manifest["binary_sha256"][str(binary)], evidence)
+
             for broker_id, command in enumerate(broker_commands):
                 broker_control = FaultControl(run_dir / f"broker-{broker_id}-fault-events.json")
                 controls.append(broker_control)
@@ -457,12 +521,15 @@ def run_case(args, case, hardware):
                 if case == "shutdown_queue":
                     manifest["worker_pause"] = broker_control.hit(armed["queue.worker_paused"])
                 dev.wait_ready(process, owned, startup_deadline)
+                capture_binary_identity(name, process, broker)
                 manifest["broker_placement"][name] = dev.placement_snapshot(process, hardware["nodes"]["1"]["cpus"],
                     1, run_dir, name, shm_name if broker_id == 0 else None)
                 if not manifest["broker_placement"][name].get("thread_cpu_masks"):
                     raise dev.RunError(name + " startup placement was not observed")
             control, process, armed = controls[0], processes[0], arms[0]
-            active_deadline = time.monotonic() + 60
+            active_timer = ActiveDeadline(ACTIVE_TIMEOUT_SECONDS)
+            active_deadline = active_timer.deadline
+            manifest["active_started_monotonic"] = active_deadline - ACTIVE_TIMEOUT_SECONDS
             if case in REAL_CLIENT_CASES:
                 client_control = FaultControl(run_dir / "client-fault-events.json")
                 manifest["client_fault_environment"] = client_control.environment()
@@ -478,23 +545,21 @@ def run_case(args, case, hardware):
             manifest["status"] = "running"
             dev.write_json(run_dir / "manifest.json", manifest)
             def capture_driver_placement():
+                capture_binary_identity("driver", workload, driver)
                 manifest["driver_placement"] = dev.placement_snapshot(workload, hardware["nodes"]["0"]["cpus"],
                     0, run_dir, "driver")
             if case == "ack_publication_lag":
                 # Record placement while the first ACK hook is waiting for START.
                 client_control.ready(20)
-                manifest["driver_placement"] = dev.placement_snapshot(workload, hardware["nodes"]["0"]["cpus"],
-                    0, run_dir, "driver")
+                capture_driver_placement()
                 manifest["fault_hits"] = ack_schedule(client_control, ready=False)
             elif case == "ack_hwm_withheld":
-                manifest["fault_hits"] = withheld_ack_schedule(client_control)
-                capture_driver_placement()
+                manifest["fault_hits"] = withheld_ack_schedule(client_control, capture_driver_placement)
             elif case == "session_reopen_resubmit":
                 manifest["fault_hits"] = reopen_schedule(control, client_control, armed, capture_driver_placement)
             else:
                 driver_control.wait("driver_ready")
-                manifest["driver_placement"] = dev.placement_snapshot(workload, hardware["nodes"]["0"]["cpus"],
-                    0, run_dir, "driver")
+                capture_driver_placement()
                 if not manifest["driver_placement"].get("thread_cpu_masks"):
                     raise dev.RunError("native driver placement was not observed at its startup barrier")
                 driver_control.proceed()
@@ -545,6 +610,11 @@ def run_case(args, case, hardware):
         manifest["error"] = f"{type(error).__name__}: {error}"
         print(f"{case}: {manifest['error']}", file=sys.stderr)
     finally:
+        # Cancel before cleanup: controller cancellation and child teardown have
+        # their own bounds and must not be interrupted by the workload timer.
+        if active_timer:
+            active_timer.close()
+            manifest["active_ended_monotonic"] = time.monotonic()
         cleanup_handlers = {number: signal.signal(number, signal.SIG_IGN)
                             for number in (signal.SIGINT, signal.SIGTERM)}
         if owned:
@@ -583,7 +653,7 @@ def run_case(args, case, hardware):
                     marker.unlink()
             except FileNotFoundError:
                 pass
-        manifest["shared_memory_removed"] = not shm_path.exists()
+        manifest["shared_memory_removed"] = not os.path.lexists(shm_path)
         if not manifest["shared_memory_removed"]:
             passed = False
         manifest["status"] = "dry-run" if args.dry_run and passed else "passed" if passed else "failed"
@@ -598,7 +668,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/debug-faults")
     parser.add_argument("--run-root", type=Path, default=Path(tempfile.gettempdir()))
-    parser.add_argument("--case", choices=("all",) + CASES + CLIENT_EXTENSIONS, default="all")
+    parser.add_argument("--case", choices=("all",) + CASES, default="all")
     parser.add_argument("--startup-timeout", type=float, default=120)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)

@@ -9,7 +9,7 @@ SSH clients or the absent NUMA node 2. Brokers use node 1 and clients use node 0
 | Inspect a smoke run | `python3 tools/dev_cluster.py --build-dir build/debug --dry-run` | Configuration, layout and command manifest; no cluster allocation |
 | Run an audited smoke | `python3 tools/dev_cluster.py --build-dir build/debug --brokers 3` | 32 MiB indexed delivery, ACK1 completion and owned cleanup |
 | Check legacy startup | `python3 test/integration/check_legacy_startup.py --build-dir build/debug` | ORDER0/ACK1 startup and completion; no indexed payload audit |
-| Exercise production faults | `python3 test/integration/run_production_faults.py --build-dir build/debug-faults --case all` | Explicitly enabled barriers and native prefix/cleanup oracles; separate fault build required |
+| Exercise production faults | `python3 test/integration/run_production_faults.py --build-dir build/debug-faults --case all` | All 20 cases, including real client recovery and withheld ACK; separate fault build required |
 | Run a paired broker pilot | `python3 tools/perf_compare.py --help` | Requires separately built baseline/candidate, common audited client and complete paired protocol |
 | Analyze retained pilot runs | `python3 tools/analyze_perf_comparison.py OUTPUT/index.json --output OUTPUT/analysis.json` | Rejects incomplete or mismatched protocols before qualified comparisons |
 

@@ -21,6 +21,50 @@ spec.loader.exec_module(faults)
 
 
 class ProductionFaultHarnessTests(unittest.TestCase):
+    def test_all_schedules_twenty_distinct_cases_including_real_client_recovery(self):
+        with mock.patch.object(dev, "topology", return_value={}), \
+                mock.patch.object(dev, "ClusterLock"), \
+                mock.patch.object(faults, "run_case", return_value=(True, Path("unused-manifest.json"))) as run:
+            self.assertEqual(faults.main(["--case", "all"]), 0)
+        scheduled = [call.args[1] for call in run.call_args_list]
+        self.assertEqual(tuple(scheduled), faults.CASES)
+        self.assertEqual(len(scheduled), 20)
+        self.assertEqual(len(set(scheduled)), 20)
+        self.assertTrue(set(faults.REAL_CLIENT_CASES).issubset(scheduled))
+        self.assertEqual(set(faults.PAYLOAD_UPPER_BOUNDS), set(scheduled))
+
+    def test_active_deadline_interrupts_blocked_controller_and_restores_signal(self):
+        previous = signal.getsignal(signal.SIGALRM)
+        # Keep the peer open so recv blocks instead of returning EOF.
+        parent, child = socket.socketpair()
+        deadline = faults.ActiveDeadline(0.05)
+        try:
+            with self.assertRaisesRegex(dev.RunError, "active deadline"):
+                parent.recv(1)
+        finally:
+            deadline.close()
+            deadline.close()
+            parent.close()
+            child.close()
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_executed_binary_digest_rejects_replaced_path_identity(self):
+        child = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            expected = dev.binary_digest(Path(sys.executable))
+            evidence = {}
+            faults.verify_executed_binary(child, Path(sys.executable), expected, evidence)
+            self.assertEqual(evidence["observed_sha256"], expected)
+            with self.assertRaisesRegex(dev.RunError, "differs from preflight"):
+                faults.verify_executed_binary(child, Path(sys.executable), "0" * 64, evidence)
+            self.assertEqual(evidence["declared_sha256"], "0" * 64)
+            self.assertEqual(evidence["observed_sha256"], expected)
+        finally:
+            child.communicate(timeout=3)
+
     def test_inherited_fd_and_environment_are_child_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
             # Keep both endpoints explicitly owned through process creation.
@@ -92,9 +136,16 @@ class ProductionFaultHarnessTests(unittest.TestCase):
     def test_negative_ack_control_requires_specific_failure_and_no_success(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
-            failure = ("[Publisher ACK Failure]: Did not receive ACKs for all messages. "
-                       "normalized_received=0 raw_received=0 target=2 short=2\n")
-            for invalid in ("segmentation fault", failure.replace("target=2", "target=1"),
+            failure = ("[Publisher ACK Timeout]: Waited 2 seconds for ACKs, "
+                       "normalized_received=0 raw_received=0 out of 2 (timeout=2s)\n")
+            for invalid in ("segmentation fault", failure.replace("out of 2", "out of 1"),
+                            failure.replace("normalized_received=0", "normalized_received=1"),
+                            failure.replace("raw_received=0", "raw_received=1"),
+                            failure.replace("timeout=2s", "timeout=20s"),
+                            failure.replace("Waited 2 seconds", "Waited 20 seconds"),
+                            failure + failure,
+                            "[Publisher ACK Failure]: Did not receive ACKs for all messages. "
+                            "normalized_received=0 raw_received=0 target=2 short=2\n",
                             failure + "[ACK_VERIFY] normalized_received=2\n",
                             failure + "[ORDERED_DELIVERY_AUDIT] status=passed\n"):
                 (base / "driver.log").write_text(invalid)
@@ -146,6 +197,17 @@ class ProductionFaultHarnessTests(unittest.TestCase):
             faults.session_schedule(controller, driver, {"scanner": 1, "expiry": 2}, "fence_before_commit")
         controller.release.assert_not_called()
 
+    def test_fence_before_commit_selects_multi_client_classification_path(self):
+        controller = mock.Mock()
+        controller.arm.side_effect = [1, 2]
+        faults.arm_broker_hooks(controller, "fence_before_commit")
+        self.assertEqual(controller.arm.call_args_list, [
+            mock.call("classification.before_expiry_sweep", client=1001, epoch=1, batch=3, value=1000000000000),
+            mock.call("scanner.after_collect", client=1002, epoch=1, batch=1)])
+        self.assertEqual(faults.SESSION_CASES["fence_before_commit"], 8)
+        self.assertEqual(faults.PAYLOAD_UPPER_BOUNDS["fence_before_commit"], 6 * 8192)
+        self.assertEqual(faults.PAYLOAD_UPPER_BOUNDS["commit_before_fence"], 5 * 8192)
+
     def fake_build(self, base, failed_driver=False):
         build = base / "build"
         binaries = build / "bin"
@@ -175,10 +237,13 @@ while True: time.sleep(.1)
             path.chmod(0o700)
         return build, numactl
 
-    def fake_run(self, failed=False, dry=False):
+    def fake_run(self, failed=False, dry=False, changed_driver=False, blocked_driver=False):
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             base = Path(directory)
             build, numactl = self.fake_build(base, failed)
+            if blocked_driver:
+                (build / "bin/production_fault_driver").write_text("#!/usr/bin/env python3\nimport time; time.sleep(60)\n")
+                stack.enter_context(mock.patch.object(faults, "ACTIVE_TIMEOUT_SECONDS", 0.1))
             private_tempfile = mock.Mock(wraps=tempfile)
             private_tempfile.gettempdir.return_value = str(base)
             stack.enter_context(mock.patch.object(dev, "tempfile", private_tempfile))
@@ -186,6 +251,14 @@ while True: time.sleep(.1)
             stack.enter_context(mock.patch.object(faults, "memory_preflight", return_value={}))
             stack.enter_context(mock.patch.object(dev, "placement_snapshot", return_value={"thread_cpu_masks": {"1": "0"}}))
             stack.enter_context(mock.patch.object(dev, "check_ports"))
+            # These fixtures are scripts, so /proc/PID/exe names their Python
+            # interpreter. The real-process test above covers executable hashes.
+            def fixture_binary_identity(process, declared, expected, evidence):
+                evidence.update(pid=process.pid, declared_sha256=expected,
+                                observed_sha256="0" * 64 if changed_driver and declared.name == "production_fault_driver" else expected)
+                if evidence["observed_sha256"] != expected:
+                    raise dev.RunError("executed binary differs from preflight")
+            stack.enter_context(mock.patch.object(faults, "verify_executed_binary", side_effect=fixture_binary_identity))
             stack.enter_context(mock.patch.object(faults.shutil, "which", return_value=str(numactl)))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
@@ -210,6 +283,24 @@ while True: time.sleep(.1)
         self.assertEqual(code, 0, manifest)
         self.assertEqual(manifest["exit_codes"], {"broker-0": 0, "driver": 0})
         self.assertFalse(manifest["forced_shutdown"])
+        self.assertEqual(set(manifest["executed_binaries"]), {"broker-0", "driver"})
+
+    def test_binary_replacement_fails_before_native_driver_continuation(self):
+        code, manifest = self.fake_run(changed_driver=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIn("differs from preflight", manifest["error"])
+        self.assertNotIn("oracle", manifest)
+        self.assertFalse(manifest["forced_shutdown"])
+
+    def test_active_deadline_covers_driver_startup_barrier_and_owned_cleanup(self):
+        code, manifest = self.fake_run(blocked_driver=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIn("active deadline", manifest["error"])
+        self.assertLess(manifest["active_ended_monotonic"] - manifest["active_started_monotonic"], 3)
+        self.assertFalse(manifest["forced_shutdown"])
+        self.assertTrue(manifest["shared_memory_removed"])
 
     def test_dry_run_creates_neither_children_nor_region(self):
         code, manifest = self.fake_run(dry=True)

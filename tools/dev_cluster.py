@@ -560,9 +560,14 @@ def main(argv=None, *, profile=None):
             try:
                 owned.close()
                 manifest["forced_shutdown"] = owned.forced
+                manifest["exit_codes"] = {name: child.returncode for name, child in owned.children}
                 if owned.forced and exit_code == 0:
                     manifest["status"] = "failed"
                     manifest["error"] = "forced termination was needed: " + ", ".join(owned.forced)
+                    exit_code = 1
+                if any(child.returncode != 0 for _, child in owned.children):
+                    manifest["status"] = "failed"
+                    manifest["cleanup_error"] = "nonzero child exit: " + repr(manifest["exit_codes"])
                     exit_code = 1
             except (OSError, subprocess.TimeoutExpired) as error:
                 manifest["status"] = "failed"
@@ -576,6 +581,11 @@ def main(argv=None, *, profile=None):
                     shm_path.unlink()
             except FileNotFoundError:
                 pass
+        manifest["shared_memory_removed"] = not os.path.lexists(shm_path)
+        if not manifest["shared_memory_removed"]:
+            manifest["status"] = "failed"
+            manifest["cleanup_error"] = "shared-memory path remains; owned inode was not safely removable"
+            exit_code = 1
         for marker in markers:
             try:
                 info = marker.lstat()

@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 
 import dev_cluster as dev
@@ -231,6 +232,71 @@ def source_snapshot(source, destination, output):
     result = {"revision": revision, "git_status": status_text, "tracked_patch_sha256": hashlib.sha256(patch).hexdigest(),
               "untracked_files": inventory, "source_snapshot": str(destination), "complete": True,
               "scope": "current source checkout captured; association with compiled artifacts is recorded separately in build evidence"}
+    dev.write_json(destination / "source.json", result)
+    return result
+
+
+def archived_source_snapshot(source, archive_path, destination):
+    """Bind a non-git CMAKE_HOME_DIRECTORY to archive_source.py evidence."""
+    destination.mkdir(mode=0o700)
+    archive = destination / "source.tar.gz"
+    inventory_path = destination / "source.tar.gz.json"
+    shutil.copyfile(archive_path, archive)
+    shutil.copyfile(archive_path.with_suffix(archive_path.suffix + ".json"), inventory_path)
+    inventory = json.loads(inventory_path.read_text())
+    revision = inventory.get("revision", "")
+    files = inventory.get("files")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise dev.RunError("source archive inventory has no valid revision")
+    if not isinstance(files, dict) or not files:
+        raise dev.RunError("source archive inventory is empty or invalid")
+    digest = dev.binary_digest(archive)
+    if digest != inventory.get("archive_sha256"):
+        raise dev.RunError("source archive SHA256 differs from inventory")
+    # This mode is an exclusive extraction with an out-of-tree build. Extra
+    # headers or globbed sources could otherwise change the build invisibly.
+    actual_files = set()
+    for path in source.rglob("*"):
+        if path.is_symlink() or (not path.is_file() and not path.is_dir()):
+            raise dev.RunError("CMAKE_HOME_DIRECTORY contains a symlink or special file: " + str(path))
+        if path.is_file():
+            actual_files.add(path.relative_to(source).as_posix())
+    if actual_files != set(files):
+        raise dev.RunError("CMAKE_HOME_DIRECTORY file inventory differs from archive: " +
+                           repr(sorted(actual_files.symmetric_difference(files))[:20]))
+    seen = set()
+    with tarfile.open(archive, "r:gz") as captured:
+        for member in captured:
+            name = member.name
+            relative = Path(name)
+            if (relative.is_absolute() or ".." in relative.parts or str(relative) != name or
+                    not member.isfile() or name in seen or name not in files):
+                raise dev.RunError("source archive has an unsafe, duplicate, or unlisted member: " + name)
+            seen.add(name)
+            entry = files[name]
+            if not isinstance(entry, dict):
+                raise dev.RunError("invalid source archive file entry: " + name)
+            contents = captured.extractfile(member)
+            hashed = hashlib.sha256()
+            for block in iter(lambda: contents.read(1024 * 1024), b""):
+                hashed.update(block)
+            if hashed.hexdigest() != entry.get("sha256") or member.mode != entry.get("mode"):
+                raise dev.RunError("source archive member differs from inventory: " + name)
+            actual = source / relative
+            resolved = actual.resolve()
+            if (source not in resolved.parents or actual.is_symlink() or not actual.is_file() or
+                    dev.binary_digest(actual) != entry["sha256"] or
+                    stat.S_IMODE(actual.stat().st_mode) != entry["mode"]):
+                raise dev.RunError("CMAKE_HOME_DIRECTORY source differs from archive: " + name)
+    if seen != set(files):
+        raise dev.RunError("source archive is missing inventory files")
+    result = {"revision": revision, "provenance": "archived dirty snapshot",
+              "git_status": None, "archive_sha256": digest,
+              "inventory_sha256": dev.binary_digest(inventory_path),
+              "archive": str(archive), "inventory": str(inventory_path),
+              "verified_files": len(seen), "source_directory": str(source),
+              "source_snapshot": str(destination), "complete": True,
+              "scope": "exact source file inventory, bytes, and modes match CMAKE_HOME_DIRECTORY; revision labels the base, not a clean checkout; compiled artifact association is recorded separately in build evidence"}
     dev.write_json(destination / "source.json", result)
     return result
 
@@ -511,6 +577,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-build", type=Path, required=True)
     parser.add_argument("--candidate-build", type=Path, required=True)
+    parser.add_argument("--candidate-source-archive", type=Path,
+                        help="immutable archive_source.py archive plus .json inventory for a candidate built without .git")
     parser.add_argument("--output", type=Path, required=True, help="new artifact directory; existing paths are never overwritten")
     parser.add_argument("--brokers", type=int, choices=(1, 3), required=True)
     parser.add_argument("--pairs", type=int, default=6)
@@ -561,7 +629,12 @@ def main(argv=None):
             if not os.access(broker, os.X_OK) or (version == "candidate" and not os.access(client, os.X_OK)):
                 raise dev.RunError("missing executable for " + version)
             build = build_identity(directory)
-            source = source_snapshot(Path(build["source_directory"]).resolve(), output / (version + "-source"), output)
+            source_directory = Path(build["source_directory"]).resolve()
+            if version == "candidate" and args.candidate_source_archive:
+                source = archived_source_snapshot(source_directory, args.candidate_source_archive.resolve(),
+                                                  output / (version + "-source"))
+            else:
+                source = source_snapshot(source_directory, output / (version + "-source"), output)
             if version == "baseline" and source["revision"] != BASELINE_REVISION:
                 raise dev.RunError("baseline source is not the declared comparison revision")
             if version == "baseline" and source["git_status"].strip():

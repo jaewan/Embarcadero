@@ -2,6 +2,54 @@
 
 namespace Embarcadero::testdriver {
 namespace {
+void AwaitPublishableReplicationCluster(const Options& options) {
+    auto stub = heartbeat_system::HeartBeat::NewStub(grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(options.control_port), grpc::InsecureChannelCredentials()));
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    std::string last_observation = "no cluster response";
+    while (Clock::now() < deadline) {
+        grpc::ClientContext context;
+        const auto remaining = deadline - Clock::now();
+        context.set_deadline(std::chrono::system_clock::now() +
+            std::min(remaining, std::chrono::duration_cast<Clock::duration>(std::chrono::seconds(1))));
+        heartbeat_system::ClientInfo request;
+        heartbeat_system::ClusterStatus response;
+        // The unary GetClusterStatus only fills legacy new_nodes/removed_nodes.
+        // The production subscription sends a complete broker_info snapshot
+        // immediately. Reopen for each observation rather than depending on the
+        // stream's update-version timing after that first snapshot.
+        auto reader = stub->SubscribeToCluster(&context, request);
+        const bool received = reader->Read(&response);
+        context.TryCancel();
+        const auto status = reader->Finish();
+        // Cancellation is deliberate after a successful initial Read; its final
+        // status does not invalidate the snapshot we actually received.
+        if (received) {
+            std::array<bool, 3> publishable{};
+            bool valid = response.broker_info_size() == 3;
+            last_observation.clear();
+            for (const auto& broker : response.broker_info()) {
+                const int id = broker.broker_id();
+                last_observation += " id=" + std::to_string(id) +
+                    " accepts_publishes=" + std::to_string(broker.accepts_publishes());
+                if (id < 0 || id >= 3 || !broker.accepts_publishes() || publishable[id]) {
+                    valid = false;
+                } else {
+                    publishable[id] = true;
+                }
+            }
+            if (valid && std::all_of(publishable.begin(), publishable.end(), [](bool ready) { return ready; })) {
+                std::cout << "[FAULT_CLUSTER_READY] publishable_brokers=0,1,2" << std::endl;
+                return;
+            }
+        } else {
+            last_observation = status.error_message();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    throw std::runtime_error("three-broker publishable membership did not become ready: " + last_observation);
+}
+
 void CheckUncompletedReplica(const RegionObserver& region, PublisherSocket& publisher,
                             uint32_t minimum_token, uint32_t maximum_token) {
     region.CheckPrefix(1);
@@ -39,6 +87,9 @@ void CheckUncompletedReplica(const RegionObserver& region, PublisherSocket& publ
 void RunReplicationTokenShutdown(const Options& options, RegionObserver& region) {
     Require(Configuration::getInstance().config().broker.max_brokers.get() == 3,
             "replication shutdown profile requires exactly three configured brokers");
+    // A follower's local listener marker precedes its next heartbeat update.
+    // Wait for the same head membership that production topic admission checks.
+    AwaitPublishableReplicationCluster(options);
     CreateTopic(options, 2, 3);
     PublisherSocket publisher(options, kPrefixClient, false, 2);
     Batch(kPrefixClient, 0, 0).Publish(publisher.ingress.value);

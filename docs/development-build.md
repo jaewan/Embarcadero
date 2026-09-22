@@ -48,3 +48,17 @@ Before public release:
 
 The legacy setup script remains for historical hosts. Prefer the disposable
 bootstrap for release qualification instead of applying its host tuning.
+
+The 2026-09-22 validation used a fresh Ubuntu 24.04.3 base rootfs under a
+user-local PRoot, with packages and Folly installed inside that rootfs. Archived
+source snapshot `03` passed the full build, all 46 supported CTests, and the minimal
+client build and dependency-exclusion check. The clean bootstrap exposed a
+missing GoogleMock development package; the bootstrap now installs it and CMake
+requires its headers. No host package changes were needed. Source archives,
+resolved package versions, binary manifests, and both successful and failed
+bootstrap logs are retained in `results/refactor-build/2026-09-22/` (ignored
+generated evidence). These checks establish build/test portability; host
+performance comparisons use separately matched compiler flags and dependency
+binaries.
+Later fault-driver or harness corrections have their own source archives and
+targeted checks; they are not retroactively covered by that clean-build result.

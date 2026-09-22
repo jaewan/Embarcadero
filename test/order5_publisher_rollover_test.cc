@@ -24,6 +24,26 @@ struct PublisherTestPeer {
 		ASSERT_TRUE(publisher.pubQue_.AddBuffers(0));
 	}
 
+    static void FinishInput(Publisher& publisher) {
+        publisher.pubQue_.WriteFinished();
+        publisher.publish_finished_.store(true, std::memory_order_release);
+        publisher.consumer_should_exit_.store(true, std::memory_order_release);
+    }
+    static Embarcadero::BatchHeader* ReadWorker(Publisher& publisher) {
+        return publisher.ReadPublishBatch(0);
+    }
+    static void Requeue(Publisher& publisher, Embarcadero::BatchHeader* batch) {
+        publisher.pubQue_.PauseSessionRollover();
+        const bool queued = publisher.pubQue_.EnqueueBatchForSessionRollover(0, batch);
+        publisher.pubQue_.ResumeSessionRollover();
+        publisher.NotifyPublisherWork();
+        EXPECT_TRUE(queued);
+    }
+    static void StopWorkers(Publisher& publisher) {
+        publisher.publisher_workers_stop_.store(true, std::memory_order_release);
+        publisher.NotifyPublisherWork();
+    }
+
 	static void SetAckLevel(Publisher& publisher, int ack_level) {
 		publisher.ack_level_ = ack_level;
 	}
@@ -466,3 +486,30 @@ TEST(Order5PublisherRolloverTest, Ack2MemorySinkPinsPoolWithoutOwnedCopy) {
 }
 
 }  // namespace
+
+TEST(Order5PublisherRollover, FinishedInputStillConsumesRecoveryAndStopsWithoutAnotherBatch) {
+    setenv("NUM_BROKERS", "1", 1);
+    char topic[TOPIC_NAME_SIZE] = {};
+    std::strncpy(topic, "RecoveryWorker", sizeof(topic) - 1);
+    Publisher publisher(topic, "127.0.0.1", "1212", 1, 64, 1 << 20,
+                        Embarcadero::kOrderStrong, heartbeat_system::SequencerType::EMBARCADERO);
+    PublisherTestPeer::ConfigureOrder5Session(publisher, 1);
+    auto* retained = PublisherTestPeer::SealOneBatch(publisher, 1, 0, 2);
+    ASSERT_NE(retained, nullptr);
+    PublisherTestPeer::FinishInput(publisher);
+    auto worker = std::async(std::launch::async, [&] { return PublisherTestPeer::ReadWorker(publisher); });
+    // Input completion alone must not terminate the actual sender read path.
+    const bool stayed_available = worker.wait_for(20ms) == std::future_status::timeout;
+    PublisherTestPeer::Requeue(publisher, retained);
+    const bool woke = worker.wait_for(1s) == std::future_status::ready;
+    if (!woke) PublisherTestPeer::StopWorkers(publisher);
+    auto* consumed = worker.get();
+    EXPECT_TRUE(stayed_available);
+    EXPECT_TRUE(woke);
+    EXPECT_EQ(consumed, retained);
+    if (consumed) PublisherTestPeer::ReleasePoolBatch(publisher, consumed);
+    auto stopping = std::async(std::launch::async, [&] { return PublisherTestPeer::ReadWorker(publisher); });
+    PublisherTestPeer::StopWorkers(publisher);
+    EXPECT_EQ(stopping.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(stopping.get(), nullptr);
+}

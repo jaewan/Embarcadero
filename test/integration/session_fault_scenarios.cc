@@ -2,8 +2,8 @@
 
 namespace Embarcadero::testdriver {
 namespace {
-void CheckSessionPrefix(const RegionObserver& region, size_t prefix, bool fenced, bool control) {
-    const size_t count = prefix + (control ? 1 : 0);
+void CheckSessionPrefix(const RegionObserver& region, size_t prefix, bool fenced, size_t control_batches) {
+    const size_t count = prefix + control_batches;
     const uint64_t expected = count ? count - 1 : UINT64_MAX;
     const auto deadline = After();
     while (region.Committed() != expected && Clock::now() < deadline)
@@ -12,7 +12,7 @@ void CheckSessionPrefix(const RegionObserver& region, size_t prefix, bool fenced
     for (size_t i = 0; i < count; ++i) {
         const auto* entry = region.At<GOIEntry>(kGOIOffset + i * sizeof(GOIEntry));
         Require(entry->global_seq == i && entry->client_id == (i < prefix ? kPrefixClient : kControlClient) &&
-                entry->client_seq == (i < prefix ? i : 0) && entry->session_epoch == 1 &&
+                entry->client_seq == (i < prefix ? i : i - prefix) && entry->session_epoch == 1 &&
                 entry->total_order == i * kMessagesPerBatch && entry->message_count == kMessagesPerBatch,
                 "GOI committed an unapproved identity/order");
     }
@@ -34,7 +34,7 @@ void CheckSessionPrefix(const RegionObserver& region, size_t prefix, bool fenced
     // work. It is not the client committed-message frontier. Record separately.
     const auto* cv = region.At<CompletionVectorEntry>(kCompletionVectorOffset);
     std::cout << "[SESSION_PREFIX] batches=" << prefix << " fenced=" << fenced
-              << " control=" << control << " goi=" << region.Committed()
+              << " control_batches=" << control_batches << " goi=" << region.Committed()
               << " cv_ingress_consumed=" << cv->sequencer_logical_offset.load(std::memory_order_acquire)
               << std::endl;
 }
@@ -76,11 +76,17 @@ void RunSessionFault(const Options& options, RegionObserver& region) {
     for (size_t i = 0; i < prefix_count; ++i) Batch(kPrefixClient, i, i * 2).Publish(publisher.ingress.value);
     if (prefix_count) publisher.AwaitAck(prefix_count * kMessagesPerBatch);
     for (size_t i = 0; i < prefix_count; ++i) AuditBatch(subscriber.value, i);
-    CheckSessionPrefix(region, prefix_count, false, false);
+    CheckSessionPrefix(region, prefix_count, false, 0);
+    // A second real session with a held suffix selects the production general
+    // classifier. The single-client fast path returns before the expiry sweep,
+    // so its newly ready prefix would otherwise commit in an earlier pass.
+    std::unique_ptr<PublisherSocket> control;
+    if (before) control = std::make_unique<PublisherSocket>(options, kControlClient);
     Stage(options, "session_prefix_verified");
     Continue(options);  // Controller holds epoch seal before sending the selected inputs.
     if (before) Batch(kPrefixClient, 2, 10000).Publish(publisher.ingress.value);
     Batch(kPrefixClient, empty ? 1 : 4, 20000).Publish(publisher.ingress.value);
+    if (before) Batch(kControlClient, 1, (prefix_count + 1) * 2).Publish(control->ingress.value);
     Stage(options, "session_fault_sent");
     AwaitFence(publisher, prefix_count);
     CheckSessionPrefix(region, prefix_count, true, false);
@@ -95,14 +101,15 @@ void RunSessionFault(const Options& options, RegionObserver& region) {
             answer.has_committed_prefix() == (prefix_count > 0) &&
             (!prefix_count || answer.committed_hwm() == prefix_count - 1),
             "old epoch OPEN unfenced or reports uncommitted prefix");
-    PublisherSocket control(options, kControlClient);
-    Batch(kControlClient, 0, prefix_count * 2).Publish(control.ingress.value);
-    control.AwaitAck(2);
-    AuditBatch(subscriber.value, prefix_count);
-    CheckSessionPrefix(region, prefix_count, true, true);
+    if (!control) control = std::make_unique<PublisherSocket>(options, kControlClient);
+    Batch(kControlClient, 0, prefix_count * 2).Publish(control->ingress.value);
+    const size_t control_batches = before ? 2 : 1;
+    control->AwaitAck(control_batches * kMessagesPerBatch);
+    for (size_t i = 0; i < control_batches; ++i) AuditBatch(subscriber.value, prefix_count + i);
+    CheckSessionPrefix(region, prefix_count, true, control_batches);
     Require(!Wait(subscriber.value, POLLIN, After(100)), "fenced work was delivered");
     std::cout << "[FAULT_RESULT] status=passed case=" << options.test_case
-              << " messages=" << (prefix_count + 1) * kMessagesPerBatch
+              << " messages=" << (prefix_count + control_batches) * kMessagesPerBatch
               << " exact_prefix=1 false_ack=0 fenced_open=1 recovery_control=1" << std::endl;
 }
 }  // namespace Embarcadero::testdriver

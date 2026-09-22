@@ -1313,6 +1313,8 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	// Serialize concurrent fence notifications (multiple brokers / remapped ACK
 	// sockets) so Pause/Seal/resubmit cannot interleave.
 	std::lock_guard<std::mutex> fence_lock(session_fence_handle_mu_);
+    if (publisher_workers_stop_.load(std::memory_order_acquire) ||
+        shutdown_.load(std::memory_order_acquire)) return;
 
 	// During ACK2 durable drain, identical lease restates of a frozen committed
 	// prefix must not reopen/resubmit (that re-burns BLog before ingest dedup).
@@ -1401,10 +1403,13 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 			if (!active) return;
 			self->session_fenced_reopen_pending_.store(false, std::memory_order_release);
 			self->pubQue_.ResumeSessionRollover();
+            self->NotifyPublisherWork();
 		}
 		void dismiss() { active = false; }
 	} rollover_guard{this};
+	NotifyPublisherWork();
 	const size_t sealed = pubQue_.SealAllForSessionRollover();
+	NotifyPublisherWork();
 	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=seal_done"
 	             << " sealed_messages=" << sealed;
 	if (sealed > 0) {
@@ -1539,6 +1544,7 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 				shutdown_.store(true, std::memory_order_release);
 				break;
 			}
+			NotifyPublisherWork();
 			++requeued_pool_batches;
 			if ((requeued_pool_batches % 64) == 0 ||
 			    requeued_pool_batches == suffix.size()) {
@@ -1579,6 +1585,7 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	session_fenced_reopen_pending_.store(false, std::memory_order_release);
 	// Resume the queue for epoch=N+1 publishing.
 	pubQue_.ResumeSessionRollover();
+	NotifyPublisherWork();
 	rollover_guard.dismiss();
 	LOG(WARNING) << "[SESSION_REOPEN_RESUBMIT]"
 	             << " old_epoch=" << old_epoch
@@ -1728,6 +1735,11 @@ Publisher::~Publisher() {
 	// Signal all threads to terminate [[RELAXED: Simple flags don't need ordering]]
 	publish_finished_.store(true, std::memory_order_relaxed);
 	shutdown_.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(session_fence_handle_mu_);
+        publisher_workers_stop_.store(true, std::memory_order_release);
+    }
+    NotifyPublisherWork();
 	consumer_should_exit_.store(true, std::memory_order_relaxed);
 	unacked_cv_.notify_all();
 	// [[CORFU_GATE]] Wake ordered-token-gate waiters so the joins below cannot
@@ -1742,8 +1754,14 @@ Publisher::~Publisher() {
 		ctx->TryCancel();
 	}
 
-	// Wait for all threads to complete (only if not already joined)
-	for (auto& t : threads_) {
+    std::vector<std::thread> publishers;
+    {
+        std::lock_guard<std::mutex> owner_lock(publisher_threads_mutex_);
+        threads_joined_.store(true, std::memory_order_release);
+        publishers.swap(threads_);
+    }
+	// Join outside the owner lock; cluster discovery can no longer add workers.
+	for (auto& t : publishers) {
 		if(t.joinable()){
 			try {
 				t.join();
@@ -2563,12 +2581,127 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	bool ack_wait_measured = false;
 	size_t poll_target_acks = 0;
 	size_t poll_normalized_received = 0;
+    const bool defer_publisher_join = IsOrder5SessionMode() && ack_level_ >= 1;
+    double publisher_join_ms = 0;
+    auto join_publishers = [&]() -> bool {
+        const auto begin = std::chrono::steady_clock::now();
+	// CRITICAL FIX: Use atomic flag to prevent double-join race conditions
+        std::vector<std::thread> publishers;
+        {
+            std::lock_guard<std::mutex> lock(publisher_threads_mutex_);
+            if (threads_joined_.exchange(true)) return true;
+            publishers.swap(threads_);
+        }
+        {
+			// Bound PublishThread join: previously hung forever in WaitForUnackedCapacity
+			// and never reached ACK timeout. Fail closed so harness can retry.
+			const int join_timeout_sec = [] {
+				if (const char* env = std::getenv("EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC")) {
+					const int v = std::atoi(env);
+					if (v > 0) return v;
+				}
+				return 120;
+			}();
+			// Join watchdog must wake promptly when PublishThreads finish.
+			// A previous 100ms sleep_for loop added ~100ms of artificial Poll()
+			// wall time on every healthy ORDER=5 ACK=1 run (seen as
+			// publisher_join_ms≈100 with ack_wait_ms=0), which cut short-run
+			// Bandwidth by ~11% on 4 GiB cells while Send-done matched ORDER=0.
+			std::atomic<bool> join_watchdog_stop{false};
+			std::atomic<bool> join_timed_out{false};
+			std::mutex join_watchdog_mu;
+			std::condition_variable join_watchdog_cv;
+			std::thread join_watchdog;
+			// [[CORFU_GATE]] CORFU joins are watched too: a thread stuck in a slow
+			// send loop must not hang Poll forever; forcing shutdown_ makes gate
+			// waiters abort fail-closed (C6/C7).
+			if ((IsOrder5SessionMode() && ack_level_ >= 1) ||
+			    seq_type_ == heartbeat_system::SequencerType::CORFU) {
+				join_watchdog = std::thread([this, join_timeout_sec, &join_watchdog_stop,
+				                            &join_timed_out, &join_watchdog_mu,
+				                            &join_watchdog_cv]() {
+					const auto deadline =
+						std::chrono::steady_clock::now() + std::chrono::seconds(join_timeout_sec);
+					std::unique_lock<std::mutex> lock(join_watchdog_mu);
+					while (!join_watchdog_stop.load(std::memory_order_relaxed)) {
+						if (std::chrono::steady_clock::now() >= deadline) {
+							join_timed_out.store(true, std::memory_order_release);
+							LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] after " << join_timeout_sec
+							           << "s — forcing shutdown so PublishThreads exit WaitForUnackedCapacity "
+							              "(EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC to tune)";
+							shutdown_.store(true, std::memory_order_relaxed);
+							if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+								CorfuAbortGate("publisher join watchdog timeout");
+							}
+							unacked_cv_.notify_all();
+							break;
+						}
+						join_watchdog_cv.wait_until(lock, deadline, [&join_watchdog_stop]() {
+							return join_watchdog_stop.load(std::memory_order_relaxed);
+						});
+					}
+				});
+			}
+			for (size_t i = 0; i < publishers.size(); ++i) {
+			if (publishers[i].joinable()) {
+				try {
+				// Joining publisher thread
+				publishers[i].join();
+				// Successfully joined publisher thread
+				} catch (const std::exception& e) {
+					LOG(ERROR) << "Exception joining publisher thread " << i << ": " << e.what();
+				}
+			}
+			// Publisher thread not joinable (already joined or detached)
+		}
+			{
+				std::lock_guard<std::mutex> lock(join_watchdog_mu);
+				join_watchdog_stop.store(true, std::memory_order_relaxed);
+			}
+			join_watchdog_cv.notify_all();
+			unacked_cv_.notify_all();
+			if (join_watchdog.joinable()) {
+				join_watchdog.join();
+			}
+			if (join_timed_out.load(std::memory_order_acquire)) {
+
+				LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] Poll failing closed after PublishThread join timeout";
+				LogCorfuTokenPhase();
+				return false;
+			}
+			// All publisher threads completed transmission
+		}
+
+
+        publisher_join_done_time = std::chrono::steady_clock::now();
+        publisher_join_ms += DurationMs(begin, publisher_join_done_time);
+        return true;
+    };
+    bool workers_finalized = false;
+    auto finish_publishers = [&](bool success) -> bool {
+        if (workers_finalized) return true;
+        workers_finalized = true;
+        if (!success) shutdown_.store(true, std::memory_order_release);
+        {
+            // Exclude late suffix enqueue, but never hold this gate during join:
+            // reconnecting workers can themselves observe a SessionFenced reply.
+            std::lock_guard<std::mutex> lock(session_fence_handle_mu_);
+            publisher_workers_stop_.store(true, std::memory_order_release);
+        }
+        NotifyPublisherWork();
+        unacked_cv_.notify_all();
+        return join_publishers();
+    };
+    struct WorkerCleanup {
+        std::function<void()> cleanup;
+        ~WorkerCleanup() { cleanup(); }
+    } worker_cleanup{[&] { if (!workers_finalized) (void)finish_publishers(false); }};
 	// [[LAST_PERCENT_ACK_FIX]] Seal and return reads before signaling finished.
 	// If we set publish_finished_ first, threads that get nullptr from Read() may exit
 	// before we've called SealAll(), dropping the last batches.
 	WriteFinishedOrPaused();
-	// Enter queue-drain mode. Publish threads should keep consuming queued batches
-	// until empty, then exit; do not force shutdown here.
+    // Producer input is complete. Session senders remain available for retained
+    // suffix recovery until the ACK wait finishes; other modes drain and exit.
 	pubQue_.WriteFinished();
 
 	// ACK2: suppress RTO / futile identical-fence storms from publish_finished
@@ -2672,87 +2805,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 
 	// All messages queued, waiting for transmission to complete
 
-	// CRITICAL FIX: Use atomic flag to prevent double-join race conditions
-		if (!threads_joined_.exchange(true)) {
-			// Bound PublishThread join: previously hung forever in WaitForUnackedCapacity
-			// and never reached ACK timeout. Fail closed so harness can retry.
-			const int join_timeout_sec = [] {
-				if (const char* env = std::getenv("EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC")) {
-					const int v = std::atoi(env);
-					if (v > 0) return v;
-				}
-				return 120;
-			}();
-			// Join watchdog must wake promptly when PublishThreads finish.
-			// A previous 100ms sleep_for loop added ~100ms of artificial Poll()
-			// wall time on every healthy ORDER=5 ACK=1 run (seen as
-			// publisher_join_ms≈100 with ack_wait_ms=0), which cut short-run
-			// Bandwidth by ~11% on 4 GiB cells while Send-done matched ORDER=0.
-			std::atomic<bool> join_watchdog_stop{false};
-			std::atomic<bool> join_timed_out{false};
-			std::mutex join_watchdog_mu;
-			std::condition_variable join_watchdog_cv;
-			std::thread join_watchdog;
-			// [[CORFU_GATE]] CORFU joins are watched too: a thread stuck in a slow
-			// send loop must not hang Poll forever; forcing shutdown_ makes gate
-			// waiters abort fail-closed (C6/C7).
-			if ((IsOrder5SessionMode() && ack_level_ >= 1) ||
-			    seq_type_ == heartbeat_system::SequencerType::CORFU) {
-				join_watchdog = std::thread([this, join_timeout_sec, &join_watchdog_stop,
-				                            &join_timed_out, &join_watchdog_mu,
-				                            &join_watchdog_cv]() {
-					const auto deadline =
-						std::chrono::steady_clock::now() + std::chrono::seconds(join_timeout_sec);
-					std::unique_lock<std::mutex> lock(join_watchdog_mu);
-					while (!join_watchdog_stop.load(std::memory_order_relaxed)) {
-						if (std::chrono::steady_clock::now() >= deadline) {
-							join_timed_out.store(true, std::memory_order_release);
-							LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] after " << join_timeout_sec
-							           << "s — forcing shutdown so PublishThreads exit WaitForUnackedCapacity "
-							              "(EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC to tune)";
-							shutdown_.store(true, std::memory_order_relaxed);
-							if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
-								CorfuAbortGate("publisher join watchdog timeout");
-							}
-							unacked_cv_.notify_all();
-							break;
-						}
-						join_watchdog_cv.wait_until(lock, deadline, [&join_watchdog_stop]() {
-							return join_watchdog_stop.load(std::memory_order_relaxed);
-						});
-					}
-				});
-			}
-			for (size_t i = 0; i < threads_.size(); ++i) {
-			if (threads_[i].joinable()) {
-				try {
-				// Joining publisher thread
-				threads_[i].join();
-				// Successfully joined publisher thread
-				} catch (const std::exception& e) {
-					LOG(ERROR) << "Exception joining publisher thread " << i << ": " << e.what();
-				}
-			}
-			// Publisher thread not joinable (already joined or detached)
-		}
-			{
-				std::lock_guard<std::mutex> lock(join_watchdog_mu);
-				join_watchdog_stop.store(true, std::memory_order_relaxed);
-			}
-			join_watchdog_cv.notify_all();
-			unacked_cv_.notify_all();
-			if (join_watchdog.joinable()) {
-				join_watchdog.join();
-			}
-			if (join_timed_out.load(std::memory_order_acquire)) {
-				publisher_join_done_time = std::chrono::steady_clock::now();
-				LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] Poll failing closed after PublishThread join timeout";
-				LogCorfuTokenPhase();
-				return false;
-			}
-			// All publisher threads completed transmission
-		}
-		publisher_join_done_time = std::chrono::steady_clock::now();
+    if (!defer_publisher_join && !join_publishers()) return false;
 		// [[CORFU_GATE]] Fail fast (C5): a poisoned gate means at least one batch
 		// was lost and successors were stopped. Do not wait out the ACK timeout;
 		// the run is terminally failed and its counters mark it INVALID.
@@ -3005,10 +3058,12 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 				}
 	}
 
+    if (!finish_publishers(true)) return false;
+
 	// IMPROVED: Graceful disconnect - keep gRPC context alive for subscriber
 	// Only set publish_finished flag, don't shutdown entire system
 	// The gRPC context remains active to support subscriber cluster management
-	// Publisher data connections are already closed by joined threads
+	// Publisher data connections are closed by joined threads
 #ifdef COLLECT_LATENCY_STATS
 	WritePublishLatencyResults();
 #endif
@@ -3022,9 +3077,11 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	          << " ack_enabled=" << (ack_level_ >= 1 ? 1 : 0)
 	          << " queue_drain_ms=" << std::fixed << std::setprecision(3)
 	          << DurationMs(poll_start_time, queue_drain_done_time)
-	          << " publisher_join_ms=" << DurationMs(queue_drain_done_time, publisher_join_done_time)
+	          << " publisher_join_ms=" << publisher_join_ms
 	          << " ack_wait_ms=" << (ack_wait_measured ? DurationMs(ack_wait_start_time, ack_wait_done_time) : 0.0)
-	          << " post_ack_ms=" << (ack_wait_measured ? DurationMs(ack_wait_done_time, poll_done_time) : 0.0)
+	          << " post_ack_ms=" << (ack_wait_measured ? std::max(0.0,
+                  DurationMs(ack_wait_done_time, poll_done_time) -
+                  (defer_publisher_join ? publisher_join_ms : 0.0)) : 0.0)
 	          << " total_poll_ms=" << DurationMs(poll_start_time, poll_done_time)
 	          << " target_acks=" << poll_target_acks
 	          << " normalized_acks=" << poll_normalized_received;
@@ -3773,6 +3830,37 @@ close(epoll_fd);
 close(server_sock);
 }
 
+void Publisher::NotifyPublisherWork() {
+    {
+        std::lock_guard<std::mutex> lock(publisher_work_mutex_);
+        ++publisher_work_generation_;
+    }
+    publisher_work_cv_.notify_all();
+}
+
+Embarcadero::BatchHeader* Publisher::ReadPublishBatch(int queue_index) {
+    auto read = [&] { return static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(queue_index)); };
+    auto* batch = read();
+    while (!batch && publish_finished_.load(std::memory_order_acquire) &&
+           IsOrder5SessionMode() && ack_level_ >= 1 &&
+           !publisher_workers_stop_.load(std::memory_order_acquire) &&
+           !shutdown_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lock(publisher_work_mutex_);
+        const auto generation = publisher_work_generation_;
+        // Recheck under the notification mutex: enqueue-before-wait cannot be lost.
+        batch = read();
+        if (batch) break;
+        publisher_work_cv_.wait_for(lock, std::chrono::milliseconds(100), [&] {
+            return publisher_work_generation_ != generation ||
+                publisher_workers_stop_.load(std::memory_order_acquire) ||
+                shutdown_.load(std::memory_order_acquire);
+        });
+        lock.unlock();
+        batch = read();
+    }
+    return batch;
+}
+
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	ScopedFd sock, efd;  // [[Phase 2.2]] RAII: closed when thread returns or on reassignment
 	size_t sent_msgs = 0;
@@ -3868,7 +3956,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			int n = epoll_wait(efd.get(), events, 64, 1);
 			if (n == 0) {
 				// Timeout - check if we should continue
-				if (shutdown_.load(std::memory_order_relaxed) || publish_finished_.load(std::memory_order_relaxed)) {
+				if (shutdown_.load(std::memory_order_relaxed) ||
+                    publisher_workers_stop_.load(std::memory_order_acquire)) {
 				// PublishThread: Handshake interrupted by shutdown
 				break;
 				}
@@ -3991,16 +4080,18 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Read a batch from the queue (QueueBuffer)
 		Embarcadero::BatchHeader* batch_header =
-			static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx));
+			ReadPublishBatch(pubQuesIdx);
 
-		// No batch available: exit only if shutdown requested and queue is drained.
+        // ReadPublishBatch keeps session recovery consumers available after
+        // producer completion; nullptr then means final stop or a legacy drain.
 		if (batch_header == nullptr || batch_header->total_size == 0) {
-			// When a fence is in progress (session_fenced_reopen_pending_=true),
-			// PublishThread must NOT sleep here. SealAllForSessionRollover() in
-			// HandleSessionFenced tries to push to consumer queues; if threads
-			// sleep instead of draining, the queues fill and SealCurrentAndAdvance
-			// deadlocks. Just continue normally — Read() will return work once
-			// ResumeSessionRollover() is called.
+            if (shutdown_.load(std::memory_order_acquire) ||
+                publisher_workers_stop_.load(std::memory_order_acquire)) break;
+            // Poll can mark producer completion after ReadPublishBatch returned
+            // null. The exit decision itself must use final session completion.
+            if (IsOrder5SessionMode() && ack_level_ >= 1 &&
+                !publisher_workers_stop_.load(std::memory_order_acquire) &&
+                !shutdown_.load(std::memory_order_acquire)) continue;
 			if (consumer_should_exit_.load(std::memory_order_relaxed)) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
 				// This ensures the connection stays alive even if this thread got no batches
@@ -4567,16 +4658,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// requested, in which case waiters abort via the gate's shutdown check).
 	corfu_exit_guard.clean = true;
 
-	// IMPROVED: Keep connections alive for subscriber
-	// Don't close data connections when publisher finishes - this would cause brokers to shutdown
-	// The connections will be cleaned up when the Publisher object is destroyed
-	//
-	// NOTE: We intentionally do NOT close sock and efd here to keep broker connections alive
-	// This allows the subscriber to continue working after publisher finishes
-	// Resources will be cleaned up in the Publisher destructor
-	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Exiting main loop. Socket " << sock.get()
-	        << " kept open for ACKs. publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
-	        << ", shutdown=" << shutdown_.load(std::memory_order_relaxed);
+    // ScopedFd owns the ingress/epoll descriptors until this worker returns.
+    VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Exiting main loop; closing socket "
+            << sock.get() << " publish_finished=" << publish_finished_.load()
+            << ", shutdown=" << shutdown_.load();
 }
 
 void Publisher::SubscribeToClusterStatus() {
@@ -4793,6 +4878,10 @@ void Publisher::SubscribeToClusterStatus() {
 }
 
 bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id, size_t queue_size) {
+    std::unique_lock<std::mutex> owner_lock(publisher_threads_mutex_);
+    if (threads_joined_.load(std::memory_order_acquire) ||
+        publisher_workers_stop_.load(std::memory_order_acquire) ||
+        shutdown_.load(std::memory_order_acquire)) return false;
 	// Use queue_size parameter (caller reads under mutex)
 	if (!pubQue_.AddBuffers(queue_size)) {
 		LOG(ERROR) << "Failed to add buffers for broker " << broker_id;
@@ -4806,9 +4895,14 @@ bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id, size_t qu
 	try {
 		for (size_t i = 0; i < num_threads; i++) {
 			int thread_idx = num_threads_.fetch_add(1);
-			threads_.emplace_back(&Publisher::PublishThread, this, broker_id, thread_idx);
+            try {
+                threads_.emplace_back(&Publisher::PublishThread, this, broker_id, thread_idx);
+            } catch (...) {
+                num_threads_.fetch_sub(1);
+                throw;
+            }
+            ++created;
 			created_queue_indices.push_back(static_cast<size_t>(thread_idx));
-			created++;
 		}
 		// So producer round-robins only over queues that have consumers (no ghost queues).
 		pubQue_.SetActiveQueues(static_cast<size_t>(num_threads_.load(std::memory_order_relaxed)));
@@ -4820,12 +4914,21 @@ bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id, size_t qu
 		}
 	} catch (const std::exception& e) {
 		LOG(ERROR) << "AddPublisherThreads: failed after " << created << " threads: " << e.what();
-		// Rollback: join created threads and revert num_threads_
-		for (size_t j = 0; j < created; j++) {
-			if (threads_.back().joinable()) threads_.back().join();
-			threads_.pop_back();
-			num_threads_.fetch_sub(1);
-		}
+        // Partial construction is terminal. Wake started workers before joining
+        // them; they must not wait for future producer work during rollback.
+        shutdown_.store(true, std::memory_order_release);
+        pubQue_.WriteFinished();
+        NotifyPublisherWork();
+        unacked_cv_.notify_all();
+        // Freeze ownership, then release the lifecycle lock before any join.
+        threads_joined_.store(true, std::memory_order_release);
+        std::vector<std::thread> failed_workers;
+        failed_workers.swap(threads_);
+        num_threads_.fetch_sub(static_cast<int>(created));
+        owner_lock.unlock();
+        for (auto& worker : failed_workers) {
+            if (worker.joinable()) worker.join();
+        }
 		return false;
 	}
 	return true;

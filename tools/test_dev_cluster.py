@@ -153,13 +153,13 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("unrecognized arguments", rejected.stderr)
             self.assertFalse(lock.exists())
 
-    def fake_build(self, directory):
+    def fake_build(self, directory, shutdown_exit=0):
         build = directory / "build"
         binaries = build / "bin"
         binaries.mkdir(parents=True)
         broker = binaries / "embarlet"
         broker.write_text("#!/usr/bin/env python3\n" + """
-import json, os, pathlib, sys, time
+import json, os, pathlib, signal, sys, time
 if '--print-layout' in sys.argv:
     print(json.dumps({'region_bytes': 64 * 1024**3, 'metadata_bytes': 33 * 1024**3,
                       'payload_bytes': 31 * 1024**3, 'segment_size': 256 * 1024**2,
@@ -168,9 +168,10 @@ if '--print-layout' in sys.argv:
 assert '--emul' in sys.argv
 assert os.environ['EMBARCADERO_CXL_SHM_NAME'].startswith('/embarcadero-dev-')
 assert os.environ['EMBARCADERO_CXL_BASE_ADDR'] == '0x400000000000'
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(SHUTDOWN_EXIT))
 pathlib.Path('/tmp/embarlet_%s_ready' % os.getpid()).write_text('ready\\n')
 time.sleep(60)
-""")
+""".replace("SHUTDOWN_EXIT", str(shutdown_exit)))
         client = binaries / "throughput_test"
         client.write_text("#!/usr/bin/env python3\n" + """
 import pathlib
@@ -251,10 +252,52 @@ print('[ORDERED_DELIVERY_AUDIT] status=passed messages=8192 expected=8192 payloa
             manifest = json.loads(path.read_text())
             self.assertEqual(code, 0, manifest)
             self.assertEqual(manifest["status"], "passed")
+            self.assertTrue(manifest["shared_memory_removed"])
+            self.assertEqual(manifest["exit_codes"], {"broker-0": 0, "broker-1": 0, "broker-2": 0, "client": 0})
             self.assertFalse(Path(manifest["shared_memory"]).exists())
             for pid in manifest["pids"].values():
                 self.assertFalse(Path(f"/proc/{pid}").exists())
                 self.assertFalse(Path(f"/tmp/embarlet_{pid}_ready").exists())
+
+    def test_nonzero_broker_exit_during_cleanup_cannot_pass_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build, numactl = self.fake_build(base, shutdown_exit=7)
+            with self.fake_host(numactl):
+                code = runner.main(["--build-dir", str(build), "--run-root", str(base)])
+            manifest = json.loads(next(base.glob("embarcadero-dev-*/manifest.json")).read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["exit_codes"], {"broker-0": 7, "client": 0})
+            self.assertEqual(manifest["smoke"]["audited_messages"], 8192)
+            self.assertFalse(manifest["forced_shutdown"])
+            self.assertTrue(manifest["shared_memory_removed"])
+
+    def test_replaced_shared_inode_is_preserved_and_prevents_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build, numactl = self.fake_build(base)
+            original = runner.OwnedProcesses.close
+            replacements = []
+            def replace_after_cleanup(owned):
+                original(owned)
+                if not replacements:
+                    path = Path("/dev/shm") / owned.env["EMBARCADERO_CXL_SHM_NAME"].lstrip("/")
+                    replacement = path.with_name(path.name + "-replacement")
+                    replacement.write_text("replacement inode is not owned by the runner")
+                    os.replace(replacement, path)
+                    replacements.append(path)
+            try:
+                with self.fake_host(numactl), mock.patch.object(runner.OwnedProcesses, "close", replace_after_cleanup):
+                    code = runner.main(["--build-dir", str(build), "--run-root", str(base)])
+                manifest = json.loads(next(base.glob("embarcadero-dev-*/manifest.json")).read_text())
+                self.assertEqual(code, 1)
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["shared_memory_removed"])
+                self.assertEqual(replacements[0].read_text(), "replacement inode is not owned by the runner")
+            finally:
+                for path in replacements:
+                    path.unlink()
 
     def test_startup_failure_keeps_lock_until_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:

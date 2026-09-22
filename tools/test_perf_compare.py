@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """No hardware allocations: test paired protocol and owned fake processes."""
 import contextlib
+import hashlib
+import io
+import tarfile
 import json
 import os
 from pathlib import Path
@@ -13,6 +16,60 @@ import perf_compare as perf
 
 
 class PerfTests(unittest.TestCase):
+    def test_archived_source_binds_inventory_archive_and_actual_build_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "CMakeLists.txt").write_bytes(b"project(test)\n")
+            (source / "CMakeLists.txt").chmod(0o644)
+            archive = root / "source.tar.gz"
+            data = (source / "CMakeLists.txt").read_bytes()
+            with tarfile.open(archive, "w:gz") as tar:
+                member = tarfile.TarInfo("CMakeLists.txt")
+                member.size, member.mode = len(data), 0o644
+                tar.addfile(member, io.BytesIO(data))
+            inventory = {"revision": "a" * 40, "archive_sha256": perf.dev.binary_digest(archive),
+                         "files": {"CMakeLists.txt": {"sha256": hashlib.sha256(data).hexdigest(), "mode": 0o644}}}
+            sidecar = archive.with_suffix(".gz.json")
+            sidecar.write_text(json.dumps(inventory))
+            result = perf.archived_source_snapshot(source, archive, root / "valid")
+            self.assertEqual(result["provenance"], "archived dirty snapshot")
+            self.assertIsNone(result["git_status"])
+            self.assertEqual(result["verified_files"], 1)
+            self.assertEqual(Path(result["archive"]).read_bytes(), archive.read_bytes())
+            self.assertEqual(Path(result["inventory"]).read_bytes(), sidecar.read_bytes())
+            extra = source / "extra.h"
+            extra.write_text("// unarchived include\n")
+            with self.assertRaisesRegex(perf.dev.RunError, "file inventory differs"):
+                perf.archived_source_snapshot(source, archive, root / "extra-file")
+            extra.unlink()
+            extra.symlink_to(source / "CMakeLists.txt")
+            with self.assertRaisesRegex(perf.dev.RunError, "symlink"):
+                perf.archived_source_snapshot(source, archive, root / "extra-symlink")
+            extra.unlink()
+            (source / "CMakeLists.txt").write_bytes(b"project(changed)\n")
+            with self.assertRaisesRegex(perf.dev.RunError, "CMAKE_HOME_DIRECTORY"):
+                perf.archived_source_snapshot(source, archive, root / "changed")
+            (source / "CMakeLists.txt").unlink()
+            with self.assertRaisesRegex(perf.dev.RunError, "CMAKE_HOME_DIRECTORY"):
+                perf.archived_source_snapshot(source, archive, root / "missing")
+            (source / "CMakeLists.txt").write_bytes(data)
+            (source / "CMakeLists.txt").chmod(0o644)
+            inventory["archive_sha256"] = "0" * 64
+            sidecar.write_text(json.dumps(inventory))
+            with self.assertRaisesRegex(perf.dev.RunError, "SHA256"):
+                perf.archived_source_snapshot(source, archive, root / "wrong-archive")
+            inventory["archive_sha256"] = perf.dev.binary_digest(archive)
+            inventory["files"]["CMakeLists.txt"]["sha256"] = "0" * 64
+            sidecar.write_text(json.dumps(inventory))
+            with self.assertRaisesRegex(perf.dev.RunError, "member differs"):
+                perf.archived_source_snapshot(source, archive, root / "wrong-member")
+            inventory["revision"] = ""
+            sidecar.write_text(json.dumps(inventory))
+            with self.assertRaisesRegex(perf.dev.RunError, "revision"):
+                perf.archived_source_snapshot(source, archive, root / "no-revision")
+
     def test_compile_contract_respects_last_wins_and_architecture_order(self):
         with mock.patch.object(perf.dev, "binary_digest", return_value="compiler"):
             a = perf.compile_contract(["-O2", "-O3", "-DFOO=1", "-UFOO", "-march=native", "-mno-avx"], "c++", "macros")

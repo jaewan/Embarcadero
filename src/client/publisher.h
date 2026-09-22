@@ -271,7 +271,7 @@ class Publisher {
 	// Last fence HWM credited during ACK2 drain; identical restates must not
 	// reopen/resubmit storms, but a newer HWM with remaining suffix may resubmit.
 	std::atomic<uint64_t> last_ack_drain_fence_hwm_{UINT64_MAX};
-	// Set true by Poll() and destructor; PublishThread checks only this (one load) when queue empty.
+	// Producer completion/drain hint. Session workers additionally await final ACK completion.
 	std::atomic<bool> consumer_should_exit_{false};
 	char pad_consumer_exit_[64 - 3 * sizeof(std::atomic<bool>)];  // pad to next cache line
 		std::atomic<bool> connected_{false};
@@ -569,4 +569,15 @@ class Publisher {
 		size_t read_fail_count_{0};
 
 		int expected_num_brokers_{0};
+
+    // Cold lifecycle state is appended to preserve existing hot-field offsets.
+    // Producer completion is not session completion: retained suffixes may be
+    // requeued until Poll finishes its authoritative ACK wait.
+    std::atomic<bool> publisher_workers_stop_{false};
+    std::mutex publisher_work_mutex_;
+    std::mutex publisher_threads_mutex_;
+    std::condition_variable publisher_work_cv_;
+    uint64_t publisher_work_generation_{0};
+    void NotifyPublisherWork();
+    Embarcadero::BatchHeader* ReadPublishBatch(int queue_index);
 };
