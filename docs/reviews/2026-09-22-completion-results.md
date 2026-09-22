@@ -1,0 +1,59 @@
+# Refactoring completion evidence — 2026-09-22
+
+This record covers the remaining implementation packages in the [completion ledger](2026-09-22-refactoring-completion-plan.md). The delivered scope is a bounded, single-host research prototype with explicit DRAM emulation, finite no-reuse storage, and documented research modes. **All 20 final production fault cases and all three ordinary smoke profiles passed. Final matched performance measurement is pending.** Implementation, component tests, live fault results, and performance evidence are separate claims.
+
+## Delivered software
+
+| Package | Implementation and verified boundary |
+|---|---|
+| Shared-region startup | Head publishes its chosen virtual base; followers inspect a bounded ready descriptor, validate layout/backend/extent, and attach at that base. Occupied/conflicting addresses reject without destructive `MAP_FIXED`. Mapping ownership and startup failures unwind explicitly. |
+| Storage and admission | Checked per-region geometry and bitmap allocation; bounded BLog/PBR/GOI reservations; no unsafe segment reuse; authoritative session OPEN admission and terminal fencing. The legacy memory replication sink now checks allocation and wraps before copying; oversized/failed writes cannot advance replication progress. |
+| Supported modes | Shared order/ACK/RF policy and full configured membership for replicated topics. No RF clamping or independently selected partial modulo rings. Existing research modes remain distinguished from qualified modes in the [support matrix](../support-matrix.md). |
+| Production components | Linked configuration library and `topic_session.cc`; shared mapping, reservation, session-table, wire ABI, framing, validation, cancellation, and memory-sink helpers. The four moved session method bodies were independently checked byte-for-byte against the characterized source. This does not extract the entire sequencer or client state machine. |
+| Fault instrumentation | Default-disabled inherited local controller, bounded one-shot selectors, reached/release/cancel events, native protocol driver, read-only region oracles, and owned process/region cleanup. Eighteen core cases plus two production-client extensions are implemented. |
+| Reproducibility | Optional baseline build graph, working minimal client, isolated bootstrap, dependency/binary/source manifests, owned development/fault/performance runners, and contribution/security guidance. Candidate archive verification requires an exact extracted source inventory, hashes and modes; baseline Git identity remains strict. |
+
+The source, runtime ownership, tests, and claim boundaries received independent cross-review across systems/performance, build/architecture, and integration-runner reviewers. Review found and corrected additional issues, including partial-topology admission, consumer exit during recovery, seal/consume concurrency, and test readiness/oracle assumptions. Review is not a substitute for the results below.
+
+## Builds and instrumented checks
+
+A fresh Ubuntu 24.04.3 rootfs under user-local PRoot built source09 and passed **47/47 supported CTests**. Source08 passed the minimal client build and generated-header/symbol exclusion check; source09 changes only broker Topic production inputs, leaving those client inputs unchanged. Bootstrap exposed a missing GoogleMock development dependency, which was corrected. No host package tuning was needed. [Clean source09 log](../../results/refactor-build/2026-09-22/source09-full-tests.log), [full manifest](../../results/refactor-build/2026-09-22/full-manifest-09.json), [minimal manifest](../../results/refactor-build/2026-09-22/minimal-manifest-08.json).
+
+Seven focused ASan/UBSan executables passed: configuration/layout, network safety, bounded reservation, session admission/publication, shared mapping, support policy, and memory replica sink. The actual EpochBuffer shutdown regression subsequently passed ASan/UBSan with leak detection and halt-on-error. These are component results, not a fully instrumented cluster. [Focused results](../../results/refactor-build/2026-09-22/focused-sanitizers-final.json), [epoch sanitizer log](../../results/refactor-build/2026-09-22/epoch-asan-09/test.log).
+
+The separately attempted partial ASan/UBSan publisher rollover build failed **before `main`**, in the host dependency/compatibility initialization path. Removing the compatibility object did not provide a successful instrumented qualification. The ordinary linked publisher test passes, but no publisher-ASan-clean claim follows. Earlier TSan binaries likewise failed before `main` with `unexpected memory mapping`; no TSan-clean claim is made. [Retained publisher sanitizer attempt](../../results/refactor-build/2026-09-22/rollover-asan-08/test.log).
+
+## Failures found by the live campaign
+
+The real publisher recovery scenario exposed a production lifecycle bug in source03. `Poll()` ended and joined send workers after producer input finished, before ACK completion. A later fence retained and requeued four batches, but no worker remained to send them; ACK completion timed out. The failing run remains `/tmp/embarcadero-fault-1002-hgdkjyry`.
+
+Source08 keeps ORDER5 ACK-enabled senders available through the authoritative ACK wait. Empty workers park, recovery enqueue wakes them, and every terminal Poll outcome stops and joins them. Final stop is serialized with fence recovery; joins occur outside that gate. Thread discovery cannot append to a transferred worker vector. Partial worker construction now cancels and wakes workers before joining outside the ownership lock. Cold lifecycle fields preserve existing hot-field offsets, and normal nonempty reads acquire no new lifecycle lock. The actual worker-read/requeue regression passes. The source08 real-client scenario passed exact four-message delivery, one fence, four retained suffix resubmissions, and zero timer retransmissions; the withheld-HWM control independently produced the expected two-second incomplete ACK outcome.
+
+T7 then exposed a broker shutdown cycle. `last_sequenced_epoch_` is an exclusive next-buffer cursor, despite its name. The driver waited past the final sealed epoch, while the sequencer refused to extract that current epoch until driver completion. The unchanged 15-second shutdown gate rejected the resulting delay; the failed run remains `/tmp/embarcadero-fault-1002-kyrhc5nd`.
+
+Source09 drains a sealed current epoch and waits past the actual last successful seal. Shutdown-only extraction takes the existing seal mutex so a timed-out seal cannot restore `COLLECTING` over a consumed buffer. Queue observations use their locks. A successor collection epoch opens only while scanners still need one, avoiding both stranded late work and an endless empty-epoch chain. The extraction cursor is not a commit frontier; teardown still joins the sequencer. The actual EpochBuffer regression retains identified queued work across a failed active-collector seal and a successful seal. No deadline was increased.
+
+Fixture failures are retained separately: T7 initially attempted topic admission before follower publishability reached the head, and its first readiness check used a unary RPC that did not populate `broker_info`. The corrected native driver reads and cancels bounded `SubscribeToCluster` initial snapshots. A negative ACK oracle was also corrected to recognize the production timeout diagnostic rather than require a later, unreachable failure log. These corrections do not change broker acceptance or relabel the failed attempts.
+
+## Final live qualification status
+
+The final campaign uses broker09, client08, and native driver07, with the exact split provenance recorded in the [binary/source manifest](../../results/refactor-build/2026-09-22/embarcadero-completion-fault-split-manifest-09.json). The runner hashes `/proc/PID/exe` at controlled barriers to identify the executable actually running, rather than trusting a pathname that a build may replace.
+
+The final immutable-binary campaign passed **20/20 cases**, with normal expected child exits, no forced termination, and removal of every owned region. The withheld-HWM negative case requires client exit 1; its brokers still exit 0. Active-case durations were all below the 60-second gate (maximum 10.514 seconds). The 15-second child shutdown grace is separate from the additional time needed to release tmpfs pages. [Retained final summary and per-case manifests](../../results/refactor-completion/2026-09-22/final-fault-summary.json), [original campaign index](../../results/refactor-completion/2026-09-22/embarcadero-final-fault-campaign-09.json).
+
+Coverage includes fragmented and malformed ingress, blocked admission/handshake/ACK shutdown, fence-before-commit and commit-before-fence, an empty committed prefix, real publisher suffix recovery, authoritative ACK/raw-counter lag, deliberately withheld ACK progress, full session admission, GOI/BLog exhaustion, delayed receives and readers across retained segments/PBR wraps, and missing replication-token shutdown. Final T7 produced no fabricated ACK2 or tail completion. Earlier failed and passing attempts remain in the [attempt inventory](../../results/refactor-completion/2026-09-22/fault-attempt-inventory.json); the final result does not relabel them.
+
+The [fault specification](2026-09-22-production-fault-plan.md) names exact implemented and unimplemented schedules. It does not claim synthetic concurrent commit/fence winners, OPEN during intermediate publication, multi-broker session recovery, every blocked-receive shutdown state, native disk-sync failure injection, or repeated-connection FD inventory coverage from this campaign.
+
+
+The fault-disabled Release build also passed automatic-base startup with one and three brokers, each with all **8,192 indexed messages (32 MiB)** verified. All follower mappings matched the head descriptor. A separate ORDER0/ACK1 legacy startup/completion check passed; it does not make an indexed payload-audit claim. All broker/client exits were zero, no forced termination occurred, and every owned region was removed. [Ordinary smoke index](../../results/refactor-completion/2026-09-22/smokes/index.json).
+
+## Final performance gate
+
+**Pending the final source09 matched run.** Root will record its separate campaign identities, exclusions, paired ratios and uncertainty. The earlier pilot cannot qualify changed runtime binaries. The new common client must be identical on both sides; its revised Poll phases and binary identity must be recorded. Fault-injection results are not throughput measurements. No current claim of improved performance, sustainable throughput, or general nonregression is made here.
+
+## Remaining public-release and research boundaries
+
+Owner decisions still required are the project license and an enabled private vulnerability-reporting route with maintainer contacts. Third-party provenance is recorded; documentation alone does not select a project license or activate reporting. CI configuration is not evidence of a hosted CI run.
+
+The bounded software contract deliberately retains data until region destruction and fails closed at capacity. Safe reclamation, dynamic replicated membership, restart/recovery, and independent-host failover are separate work. Absolute shared pointer fields still require equal virtual mappings across brokers: coordinated mapping contains this implementation constraint, but does not turn the implementation into the paper's position-independent design. Explicit DRAM emulation validates coherent local behavior only. Missing real CXL hardware leaves its mapping/cache visibility and final paper-performance gates open; memory-copy/accounting ACK2 is not media durability. See [architecture boundaries](../architecture/refactoring-boundaries.md), [development build scope](../development-build.md), and [security scope](../../SECURITY.md).

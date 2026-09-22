@@ -568,7 +568,7 @@ if(PkgConfig_FOUND)
             ../src/client/subscriber.cc
             ../src/client/result_writer.cc
             ../src/common/configuration.cc
-            ../src/common/compat_isoc23.cpp
+            ${EMBARCADERO_LEGACY_COMPAT_SOURCE}
         )
         target_include_directories(order5_publisher_rollover_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -614,7 +614,7 @@ if(PkgConfig_FOUND)
             ../src/client/subscriber.cc
             ../src/client/result_writer.cc
             ../src/common/configuration.cc
-            ../src/common/compat_isoc23.cpp
+            ${EMBARCADERO_LEGACY_COMPAT_SOURCE}
         )
         target_include_directories(order5_subscriber_reorder_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..

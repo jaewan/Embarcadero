@@ -1,5 +1,7 @@
 # Matched DRAM performance comparison
 
+Historical first-tranche campaign: these results are retained unchanged. Later runtime changes require the separate final comparison recorded in the [completion evidence](2026-09-22-completion-results.md); results from the two candidates are not pooled. The coordinated mapping fix has since been implemented and tested.
+
 The experiment compares baseline `ae9959dd2892af821878aa42d4e2c05fcb635466` with the first refactoring tranche. The candidate's source bytes, diff and hashes were archived before compilation. Raw artifacts are retained under `results/refactor-perf/2026-09-22/` (git-ignored); `protocol.json` records the choices before measured runs.
 
 **Outcome:** the three-broker fixed-address profile stayed within the predefined ±5% throughput band on both endpoints. The one-broker audited endpoint narrowly met the 5% nonregression bound, while its publisher-completion result was inconclusive. No endpoint established an improvement. These finite DRAM results do not establish blanket server or whole-stack nonregression, and the full refactoring/release plan remains incomplete. The campaign also exposed an automatic mapping startup failure; the local runner now selects one explicit common address, while the generic startup policy remains release work.

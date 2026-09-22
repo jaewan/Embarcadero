@@ -34,8 +34,17 @@ if(NOT EMBARCADERO_SANITIZER STREQUAL "none")
     else()
         set(_embarcadero_sanitize "-fsanitize=thread")
     endif()
-    target_compile_options(embarcadero_build_options INTERFACE "${_embarcadero_sanitize}" -fno-omit-frame-pointer)
-    target_link_options(embarcadero_build_options INTERFACE "${_embarcadero_sanitize}")
+    # Abseil changes container layout under sanitizer feature macros. Instrument
+    # fetched C/C++ dependencies as well as project targets, before FetchContent
+    # creates them, so header instantiations and linked archives share an ABI.
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${_embarcadero_sanitize}>"
+                        "$<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>")
+    add_link_options("${_embarcadero_sanitize}")
+    # Legacy symbol interposition runs during loader initialization and conflicts
+    # with sanitizer interceptors. Instrumented builds require the native runtime.
+    set(EMBARCADERO_LEGACY_COMPAT_SOURCE "")
+else()
+    set(EMBARCADERO_LEGACY_COMPAT_SOURCE "${PROJECT_SOURCE_DIR}/src/common/compat_isoc23.cpp")
 endif()
 function(embarcadero_apply_options directory)
     get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)

@@ -20,7 +20,7 @@ set(KV_CLIENT_SOURCES
     # [[GLIBC_COMPAT]] Provide __isoc23_strtoul etc. locally so binaries
     # compiled on GLIBC 2.39 (Ubuntu 24.04) run on GLIBC 2.35 (Ubuntu 22.04).
     # Mirrors src/CMakeLists.txt's throughput_test target.
-    ../../src/common/compat_isoc23.cpp
+    ${EMBARCADERO_LEGACY_COMPAT_SOURCE}
 )
 
 set(KV_INCLUDE_DIRS

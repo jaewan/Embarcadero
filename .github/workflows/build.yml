@@ -31,8 +31,8 @@ jobs:
       - name: Focused ASan and UBSan checks
         run: |
           cmake --preset asan-ubsan -B /tmp/asan -DFETCHCONTENT_SOURCE_DIR_GRPC=/tmp/full/_deps/grpc-src
-          cmake --build /tmp/asan --target configuration_safety_test network_safety_test bounded_reservation_test session_admission_test fault_control_test test_shared_mapping -j4
-          ctest --test-dir /tmp/asan -R '^(unit_configuration_safety|unit_network_safety|unit_bounded_reservation|unit_session_admission|unit_fault_control|shared_mapping)$' --output-on-failure --timeout 120
+          cmake --build /tmp/asan --target configuration_safety_test network_safety_test bounded_reservation_test session_admission_test fault_control_test test_shared_mapping test_support_contract test_memory_replica_sink test_epoch_shutdown order5_publisher_rollover_test -j4
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir /tmp/asan -R '^(unit_configuration_safety|unit_network_safety|unit_bounded_reservation|unit_session_admission|unit_fault_control|shared_mapping|unit_support_contract|unit_memory_replica_sink|unit_epoch_shutdown|unit_order5_publisher_rollover)$' --output-on-failure --timeout 120
       - name: Record provenance
         if: always()
         run: python3 tools/build_support/build_manifest.py /tmp/full --output /tmp/build-manifest.json

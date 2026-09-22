@@ -8,21 +8,30 @@ Build both brokers in Release with equivalent compiler, optimization, native ISA
 python3 tools/perf_compare.py \
   --baseline-build /path/to/baseline-build \
   --candidate-build /path/to/candidate-build \
+  --candidate-source-archive /path/to/candidate-source.tar.gz \
   --build-evidence /path/to/matched-build-evidence.json \
   --brokers 1 --output results/refactor-perf/n1-dry --dry-run
 
 python3 tools/perf_compare.py \
   --baseline-build /path/to/baseline-build \
   --candidate-build /path/to/candidate-build \
+  --candidate-source-archive /path/to/candidate-source.tar.gz \
   --build-evidence /path/to/matched-build-evidence.json \
   --brokers 1 --output results/refactor-perf/n1
 ```
 
 Repeat with `--brokers 3` and a new output directory. Existing output paths are never overwritten. Runs use the isolated developer runner's lock and owned process-group cleanup, so only one cluster runs at a time. No live integration experiment belongs in ordinary unit-test execution.
 
+For an archived candidate, `CMAKE_HOME_DIRECTORY` must identify its immutable
+extracted source. The archive's complete file inventory, bytes, and modes must
+match that directory; set `PYTHONDONTWRITEBYTECODE=1` when running Python tools
+from it. The build attestation associates each executable with its actual source
+archive. A preserved common client can have a different archive from the broker
+only with explicit per-binary provenance and unchanged relevant client inputs.
+
 The default topology experiment first runs one excluded qualification for each broker version, then six adjacent pairs in alternating AB/BA order. Each member gets a fresh, owner-only 64 GiB shared-memory region, 4 GiB segments, and explicit `--emul` on every broker. Both versions receive identical configuration and environment. The baseline lacks the v5 descriptor and layout CLI; the harness records that its geometry is checked with the candidate layout calculation, supported by source review of the unchanged offsets. A cluster never mixes broker versions.
 
-Current protocol `paired-dram-v3-fixed-mapping-base` sets `EMBARCADERO_CXL_BASE_ADDR=0x400000000000` for every broker through the existing override supported by both binaries. Before starting the client, every broker's mapping log and saved `/proc/<pid>/numa_maps` must identify that base for the owned region. An address collision fails safely instead of selecting a different fallback. This changes orchestration only; broker/client binaries remain unchanged. Automatic base negotiation for direct broker launches remains a production follow-up.
+Current protocol `paired-dram-v3-fixed-mapping-base` sets `EMBARCADERO_CXL_BASE_ADDR=0x400000000000` for every broker through the existing override supported by both binaries. Before starting the client, every broker's mapping log and saved `/proc/<pid>/numa_maps` must identify that base for the owned region. An address collision fails safely instead of selecting a different fallback. The final candidate also supports coordinated automatic base selection, tested separately by the development runner's `--automatic-mapping` profile. Keep the explicit common base in matched comparisons because the baseline lacks coordinated selection.
 
 The workload is **2 GiB total application payload**, 4 KiB messages, ORDER5, ACK1, RF0, and one sender per broker. It stays below one 4 GiB payload segment per broker on a successful run. `--payload-mib 32` can make a smaller compatibility experiment, but such artifacts cannot be pooled with the default workload. `--qualification-only` stops after the two excluded runs; use a separate directory. Qualification uses the declared workload size, not a hidden smaller warmup.
 

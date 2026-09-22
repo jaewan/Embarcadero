@@ -68,7 +68,8 @@ endif()
 if(BUILD_TESTING)
     add_subdirectory(test)
 endif()
-# Apply project options after target creation; bundled dependencies are excluded.
+# Apply ordinary project options after target creation. Sanitizer instrumentation
+# is deliberately inherited by fetched dependencies for ABI consistency.
 embarcadero_apply_options("${CMAKE_CURRENT_SOURCE_DIR}/src")
 if(EMBARCADERO_BUILD_BENCHMARKS)
     embarcadero_apply_options("${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")

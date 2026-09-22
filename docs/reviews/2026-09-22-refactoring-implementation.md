@@ -1,5 +1,7 @@
 # Initial refactoring implementation and cross-review
 
+Historical snapshot: later fixes and qualification are recorded in the [completion evidence](2026-09-22-completion-results.md) and [current ledger](2026-09-22-refactoring-completion-plan.md). Statements below describe this first tranche, not the final working tree.
+
 This records the first implementation tranche of the [refactoring plan](2026-09-22-refactoring-plan.md), against `ae9959dd2892af821878aa42d4e2c05fcb635466`. Changes are in the working tree, not committed. The pre-existing README, artifact, and experiment-plan edits were preserved. The full twelve-stage release plan is not complete.
 
 ## Delivered behavior

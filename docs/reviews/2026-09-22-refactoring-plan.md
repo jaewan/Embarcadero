@@ -1,6 +1,6 @@
 # Embarcadero refactoring and development plan
 
-Status: initial implementation tranche completed in the working tree; see the [implementation and cross-review record](2026-09-22-refactoring-implementation.md) for delivered scope, evidence, and remaining gates. The full release sequence below is not complete.
+This is the original ordered plan. Current implementation and acceptance status are tracked in the [completion ledger](2026-09-22-refactoring-completion-plan.md) and [completion evidence](2026-09-22-completion-results.md). The [initial implementation record](2026-09-22-refactoring-implementation.md) preserves the earlier tranche. Public-release and hardware gates remain distinct from software completion.
 Planning baseline: `ae9959dd2892af821878aa42d4e2c05fcb635466`, with existing working-tree changes preserved.
 
 Revised after the [systems expert review and thought experiments](2026-09-22-systems-plan-review.md). The expected reliability gains are substantial; performance improvement remains a hypothesis. Behavior-preserving extraction must meet a nonregression gate, while necessary correctness costs must be measured and explained separately.

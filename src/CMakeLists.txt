@@ -163,7 +163,7 @@ add_executable(throughput_test
     common/configuration.h
     # [[GLIBC_COMPAT]] Provide __isoc23_strtoul etc. locally so binaries
     # compiled on GLIBC 2.39 (Ubuntu 24.04) run on GLIBC 2.35 (Ubuntu 22.04).
-    common/compat_isoc23.cpp
+    ${EMBARCADERO_LEGACY_COMPAT_SOURCE}
 )
 
 target_include_directories(throughput_test PUBLIC
@@ -266,7 +266,7 @@ add_executable(scalog_global_sequencer
     common/configuration.cc
     common/configuration.h
     # [[GLIBC_COMPAT]] Provide __isoc23_* locally for GLIBC 2.35 compatibility.
-    common/compat_isoc23.cpp
+    ${EMBARCADERO_LEGACY_COMPAT_SOURCE}
 )
 
 target_include_directories(scalog_global_sequencer PUBLIC
