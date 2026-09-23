@@ -2,6 +2,7 @@
 """Run an owned, bounded DRAM smoke cluster. Python standard library only."""
 
 import argparse
+import ipaddress
 import csv
 from dataclasses import dataclass
 import fcntl
@@ -153,7 +154,9 @@ def child_environment(shm_name, brokers):
         "EMBARCADERO_REPLICATION_FACTOR": "0",
         "EMBARCADERO_CHAIN_REPLICATION_SINK": "memory-copy",
         "EMBARCADERO_RUNTIME_MODE": "throughput",
-        "EMBARCADERO_SESSION_RTO_MIN_MS": "60000",
+        # Keep the missing-predecessor retry inside the broker's default 30 s
+        # session lease. Normal local transfers finish before this floor.
+        "EMBARCADERO_SESSION_RTO_MIN_MS": "10000",
         "EMBARCADERO_ACK_TIMEOUT_SEC": "20",
         "EMBARCADERO_E2E_TIMEOUT_SEC": "20",
         "EMBARCADERO_E2E_AUDIT_MODE": "stream",
@@ -450,9 +453,15 @@ def parse_args(argv=None):
                         help="exercise production head-selected mapping and follower descriptor agreement")
     parser.add_argument("--physical-cxl", action="store_true",
                         help="bind the real-backend shared mapping to memory-only NUMA node 2")
+    parser.add_argument("--head-addr", default="127.0.0.1",
+                        help="head broker bind and advertised address for clients on a trusted test network")
     parser.add_argument("--startup-timeout", type=float, default=120)
     parser.add_argument("--shutdown-timeout", type=float, default=10)
     args = parser.parse_args(argv)
+    try:
+        ipaddress.IPv4Address(args.head_addr)
+    except ipaddress.AddressValueError:
+        parser.error("--head-addr must be an IPv4 address")
     if not 1 <= args.startup_timeout <= 300 or not 1 <= args.shutdown_timeout <= 60:
         parser.error("startup timeout must be 1..300 seconds and shutdown timeout 1..60 seconds")
     return args
@@ -465,6 +474,7 @@ def interrupted(number, _frame):
 def main(argv=None, *, profile=None):
     profile = profile or SmokeProfile()
     args = parse_args(argv)
+    head_addr = args.head_addr
     run_dir = Path(tempfile.mkdtemp(prefix=f"embarcadero-dev-{os.getuid()}-", dir=args.run_root)).resolve()
     print(f"Run artifacts: {run_dir}", flush=True)
     manifest = {"profile": profile.name, "backend": "numa2-real-cxl" if args.physical_cxl else "dram-emulation",
@@ -509,6 +519,7 @@ def main(argv=None, *, profile=None):
         config_path = run_dir / "effective-config.yaml"
         write_json(config_path, config)  # JSON is valid YAML, accepted by yaml-cpp.
         env, selected, removed = child_environment(shm_name, args.brokers)
+        env["EMBARCADERO_HEAD_ADDR"] = selected["EMBARCADERO_HEAD_ADDR"] = head_addr
         if args.automatic_mapping:
             env.pop("EMBARCADERO_CXL_BASE_ADDR", None)
             selected.pop("EMBARCADERO_CXL_BASE_ADDR", None)
@@ -529,9 +540,9 @@ def main(argv=None, *, profile=None):
             return [numactl, "--physcpubind=" + ",".join(map(str, cpus)), f"--membind={memory_nodes}"]
         commands = []
         for broker_id in range(args.brokers):
-            role = ["--head"] if broker_id == 0 else ["--follower", f"127.0.0.1:{CONTROL_PORT}"]
+            role = ["--head"] if broker_id == 0 else ["--follower", f"{head_addr}:{CONTROL_PORT}"]
             commands.append(binding(1) + [str(broker)] + ([] if args.physical_cxl else ["--emul"]) + ["--config", str(config_path)] + role)
-        client_command = binding(0) + [str(client), "--config", str(config_path), "--head_addr", "127.0.0.1",
+        client_command = binding(0) + [str(client), "--config", str(config_path), "--head_addr", head_addr,
             "-t", "1", "-o", str(profile.order), "-a", "1", "-r", "0", "-n", "1", "-m", str(MESSAGE_BYTES),
             "-s", str(PAYLOAD_BYTES), "--sequencer", "EMBARCADERO"]
         if profile.workload is not None:

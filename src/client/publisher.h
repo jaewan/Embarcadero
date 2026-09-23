@@ -499,7 +499,7 @@ class Publisher {
 			                        size_t broker_ack_end);
 			void CompleteUnackedThrough(int broker_id, size_t broker_ack_hwm);
 			void HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id);
-			void WaitForSessionSendDrain(size_t target_messages);
+			bool WaitForSessionSendDrain(size_t target_messages);
 			void RetransmitThread();
 
 	#ifdef COLLECT_LATENCY_STATS

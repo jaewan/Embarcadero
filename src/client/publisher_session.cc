@@ -369,13 +369,14 @@ bool Publisher::SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int b
 	return true;
 }
 
-void Publisher::WaitForSessionSendDrain(size_t target_messages) {
+bool Publisher::WaitForSessionSendDrain(size_t target_messages) {
 	// [[DRAIN_TIMEOUT]] Use a bounded 5 s timeout rather than the full session
 	// lease. Idle publish threads blocked in pubQue_.Read() will never advance
 	// session_sent_hwm_, so waiting the full lease (up to 180 s) just blocks the
 	// AckThread inside HandleSessionFenced — preventing Poll() from ever checking
 	// the post-fence exit condition. 5 s is enough for any genuinely in-flight
-	// batches to complete; stragglers are counted as committed by the fence HWM.
+	// batches to complete. An incomplete drain must fail closed: proceeding to
+	// the unacked snapshot would silently omit a dequeued/in-flight batch.
 	constexpr int64_t kDrainTimeoutNs = 5LL * 1000LL * 1000LL * 1000LL;
 	const int64_t deadline_ns = SteadyNowNs() + kDrainTimeoutNs;
 	while (SteadyNowNs() < deadline_ns) {
@@ -384,11 +385,12 @@ void Publisher::WaitForSessionSendDrain(size_t target_messages) {
 			std::lock_guard<std::mutex> lock(unacked_mu_);
 			sent_hwm = ack_message_base_.load(std::memory_order_acquire) + session_sent_hwm_;
 		}
-		if (sent_hwm >= target_messages) return;
+		if (sent_hwm >= target_messages) return true;
 		std::this_thread::sleep_for(std::chrono::microseconds(100));
 	}
 	LOG(WARNING) << "[SESSION_ROLLOVER_DRAIN_TIMEOUT]"
 	             << " target_messages=" << target_messages;
+	return false;
 }
 
 void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id) {
@@ -498,7 +500,17 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	if (sealed > 0) {
 		client_order_.fetch_add(sealed, std::memory_order_release);
 	}
-	WaitForSessionSendDrain(client_order_.load(std::memory_order_acquire));
+	const size_t drain_target = std::max(
+		client_order_.load(std::memory_order_acquire), pubQue_.PublishedMessages());
+	if (!WaitForSessionSendDrain(drain_target)) {
+		LOG(ERROR) << "[SESSION_REOPEN_UNSENT_BATCH]"
+		           << " target_messages=" << drain_target
+		           << " published_messages=" << pubQue_.PublishedMessages();
+		shutdown_.store(true, std::memory_order_release);
+		pubQue_.ReturnReads();
+		unacked_cv_.notify_all();
+		return;
+	}
 	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=send_drain_done";
 	requested_session_epoch_.store(new_epoch, std::memory_order_release);
 	session_epoch_.store(new_epoch, std::memory_order_release);
@@ -559,6 +571,9 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	const size_t rebased_ack_base =
 		RebasedAckBaseAfterFenceCredit(ack_base_before_local_credit, locally_committed_msgs);
 	CHECK_EQ(rebased_ack_base, ack_after_local_credit);
+	// This base anchors the new session's local retire cursor. The head's ACK
+	// wire value is already cumulative across sessions (GetClientOrdered), so
+	// EpollAckThread must not add this base to the wire value again.
 	ack_message_base_.store(rebased_ack_base, std::memory_order_release);
 	order5_last_ack_hwm_.store(rebased_ack_base, std::memory_order_release);
 	// Collapse post-fence attribution onto the global ledger so Poll/WaitUntilAcked
@@ -804,4 +819,3 @@ void Publisher::RetransmitThread() {
 		}
 	}
 }
-

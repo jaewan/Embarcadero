@@ -45,8 +45,12 @@ inline bool SessionGlobalUnackedRetired(size_t batch_global_ack_end, size_t acke
 	return batch_global_ack_end <= acked_messages;
 }
 
-inline size_t SessionGlobalAckFromGeneration(size_t ack_base, size_t generation_ack) {
-	return ack_base + generation_ack;
+// ORDER5's head ACK socket carries Topic::GetClientOrdered(client_id), which
+// counts committed messages across session epochs. The client-side fence base
+// is already part of this wire value; adding it again falsely completes Poll.
+inline size_t SessionGlobalAckFromWire(size_t locally_committed_base,
+                                      size_t cumulative_wire_ack) {
+	return std::max(locally_committed_base, cumulative_wire_ack);
 }
 
 inline bool SessionPrefixAckEnd(uint64_t batch_seq,

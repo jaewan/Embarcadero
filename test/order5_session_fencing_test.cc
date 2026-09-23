@@ -223,9 +223,13 @@ TEST(Order5SessionFencingTest, FenceRebasesAckBaseAfterLocalCreditOnce) {
 		<< "diagnostic committed_msg_hwm is not a release axis; the local credit path owns the prefix";
 	EXPECT_LT(broker_frontier_excludes_local, rebased);
 
-	const size_t suffix_ack_in_new_generation = 60;
-	EXPECT_EQ(SessionGlobalAckFromGeneration(rebased, suffix_ack_in_new_generation), 200u)
-		<< "R-G ACKs are generation-relative and must be rebased before ACK-delta accounting";
+	const size_t wire_ack_after_reopen = 200;
+	EXPECT_EQ(SessionGlobalAckFromWire(rebased, wire_ack_after_reopen), 200u)
+		<< "head ACKs are cumulative across sessions; adding the fence base would double count";
+	EXPECT_EQ(SessionGlobalAckFromWire(rebased, rebased), rebased)
+		<< "a replay of the committed frontier must not advance ACK progress";
+	EXPECT_EQ(SessionGlobalAckFromWire(rebased, broker_frontier_excludes_local), rebased)
+		<< "a stale ACK must not roll back the locally committed frontier";
 }
 
 TEST(Order5SessionFencingTest, SessionGlobalLedgerRetiresNonHeadAndRehomedBatches) {

@@ -120,6 +120,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(selected["EMBARCADERO_E2E_AUDIT_MODE"], "stream")
         self.assertEqual(selected["EMBARCADERO_SUBSCRIBER_RETAINED_BYTES"], str(256 * runner.MIB))
         self.assertEqual(selected["EMBARCADERO_SUBSCRIBER_MAX_MESSAGES"], "262144")
+        self.assertEqual(selected["EMBARCADERO_SESSION_RTO_MIN_MS"], "10000")
 
     def test_occupied_port_rejected_without_touching_listener(self):
         with socket.socket() as listener:
@@ -285,6 +286,21 @@ print('[ORDERED_DELIVERY_AUDIT] status=passed messages=8192 expected=8192 payloa
             self.assertNotIn("--emul", manifest["broker_commands"][0])
             self.assertIn("--membind=1,2", manifest["broker_commands"][0])
             self.assertIn("--membind=0", manifest["client_command"])
+
+    def test_remote_head_address_reaches_brokers_followers_and_client(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build, numactl = self.fake_build(base)
+            with self.fake_host(numactl):
+                code = runner.main(["--build-dir", str(build), "--run-root", str(base),
+                                    "--brokers", "3", "--head-addr", "10.10.10.10", "--dry-run"])
+            self.assertEqual(code, 0)
+            manifest = json.loads(next(base.glob("embarcadero-dev-*/manifest.json")).read_text())
+            self.assertEqual(manifest["environment"]["EMBARCADERO_HEAD_ADDR"], "10.10.10.10")
+            self.assertTrue(all(command[-2:] == ["--follower", "10.10.10.10:12140"]
+                                for command in manifest["broker_commands"][1:]))
+            client = manifest["client_command"]
+            self.assertEqual(client[client.index("--head_addr") + 1], "10.10.10.10")
 
     def test_legacy_profile_records_same_command_and_environment_it_executes(self):
         with tempfile.TemporaryDirectory() as directory:

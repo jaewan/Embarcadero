@@ -1044,7 +1044,7 @@ size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_mes
 	// Pipeline budget: 256MB × threads × brokers (historical buffer-optimization
 	// sweet spot). Do NOT inflate to dataset size — that forced multi-tens-of-GB
 	// hugepage mmaps and Init timeouts. QueueBuffer::AddBuffers caps via
-	// EMBARCADERO_QUEUE_POOL_MAX_BYTES (send-pipeline only; ACK credit is separate).
+	// EMBARCADERO_QUEUE_POOL_MAX_BYTES. ACK1 may retain these slots until ACK.
 	constexpr size_t kPerThreadBytes = 256ULL * 1024 * 1024;
 	constexpr size_t kMaxHintBytes = 4ULL * 1024 * 1024 * 1024;
 	const size_t num_brokers = config.config().broker.max_brokers.get();
@@ -1539,7 +1539,7 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 			// Finalize publishing
 			VLOG(5) << "Finished publishing from client";
 				if (!p.Poll(n, false)) {
-					LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
+					LOG(ERROR) << "Publish test failed: ACK completion did not match the published workload. See logs above for per-broker details.";
 					delete[] message;
 					exit(1);
 				}
@@ -1984,8 +1984,8 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	std::vector<char> message(message_size);
 
 	// Pipeline / unacked-window hint — never dataset-sized (that caused 4–48 GiB
-	// Init mmaps). AddBuffers floors at queues×32 and caps via
-	// EMBARCADERO_QUEUE_POOL_MAX_BYTES (~12 GiB). Size for ~1s at target load
+	// Init mmaps). AddBuffers targets queues×32 but honors the configured
+	// EMBARCADERO_QUEUE_POOL_MAX_BYTES cap. Size for ~1s at target load
 	// (overnight E3 peaks at 2000 MB/s) with a 2 GiB floor for unpaced runs.
 	size_t q_size = 2ULL * 1024 * 1024 * 1024;
 	if (target_mbps > 0.0) {

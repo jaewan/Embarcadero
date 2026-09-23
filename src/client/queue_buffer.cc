@@ -174,7 +174,15 @@ bool QueueBuffer::AddBuffers(size_t buf_size) {
 	const size_t hint_bytes =
 		std::min(std::max(kDefaultPoolSizeBytes, buf_size), max_pool_bytes);
 	const size_t slots_for_hint = std::max<size_t>(1, hint_bytes / slot_size_);
-	const size_t max_slots = std::max<size_t>(min_slots, max_pool_bytes / slot_size_);
+	const size_t max_slots = max_pool_bytes / slot_size_;
+	if (max_slots < 2) {
+		LOG(ERROR) << "QueueBuffer: EMBARCADERO_QUEUE_POOL_MAX_BYTES="
+		           << max_pool_bytes << " cannot hold two batch slots of "
+		           << slot_size_ << " bytes";
+		return false;
+	}
+	// The pipeline depth is a target, not permission to exceed an explicit
+	// memory budget. A smaller pool simply backpressures producers earlier.
 	const size_t slots_this_region =
 		std::min(max_slots, std::max(min_slots, slots_for_hint));
 
@@ -404,6 +412,10 @@ retry_push:
 		if (q->write(h)) {
 			write_buf_id_ = (idx + 1) % n;
 			pushed = true;
+			// Write() can block below while acquiring its next pool slot.
+			// Publisher's caller-side sealed count then lags this queued batch;
+			// fence recovery must still wait for its send/retention record.
+			published_messages_.fetch_add(num_sealed, std::memory_order_release);
 			NotifyQueueDataReady(idx);
 			break;
 		}

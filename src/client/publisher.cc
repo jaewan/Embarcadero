@@ -1621,6 +1621,17 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
 			return false;
 		}
+		// A finite ORDER5 publisher cannot acknowledge more unique messages
+		// than it submitted. A rollover can make the frontier overshoot the
+		// >= wait predicate; do not report such a run as successful.
+		if (IsOrder5SessionMode() && ack_level_ >= 1 && !kill_brokers_ &&
+		    normalized_received > target_acks) {
+			LOG(ERROR) << "[Publisher ACK Failure]: ACK frontier exceeded the published target"
+			           << " normalized_received=" << normalized_received
+			           << " raw_received=" << received
+			           << " target=" << target_acks;
+			return false;
+		}
 #if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
             if (!Embarcadero::fault::Pause("poll.after_ack_snapshot",
                     {static_cast<uint64_t>(client_id_), session_epoch_.load(), normalized_received,

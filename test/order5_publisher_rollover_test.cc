@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <future>
+#include <string>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -369,6 +371,48 @@ TEST(Order5PublisherRolloverTest, QueueBufferPauseCannotMissProducerEndWakeup) {
 	EXPECT_GT(writes.load(std::memory_order_relaxed), 0u);
 }
 
+TEST(Order5PublisherRolloverTest, QueuePoolLimitIsAnActualLimit) {
+	const char* key = "EMBARCADERO_QUEUE_POOL_MAX_BYTES";
+	const char* old = std::getenv(key);
+	const std::string prior = old ? old : "";
+	struct RestoreEnv {
+		const char* key;
+		bool had_value;
+		std::string value;
+		~RestoreEnv() {
+			if (had_value) setenv(key, value.c_str(), 1);
+			else unsetenv(key);
+		}
+	} restore{key, old != nullptr, prior};
+	setenv("EMBAR_USE_HUGETLB", "0", 1);
+
+	// The old pipeline floor forced at least 256 slots even under this cap.
+	setenv(key, "6291456", 1);
+	QueueBuffer bounded(/*num_buf=*/16, /*num_threads_per_broker=*/4,
+	                    /*client_id=*/27, /*message_size=*/4096,
+	                    Embarcadero::kOrderStrong);
+	ASSERT_TRUE(bounded.AddBuffers(0));
+	EXPECT_LE(bounded.PoolBytes(), 6u * 1024u * 1024u);
+	bounded.SetActiveQueues(16);
+	std::vector<char> message(4096, 'b');
+	size_t sealed = 0;
+	ASSERT_TRUE(bounded.Write(0, message.data(), message.size(),
+	                          message.size() + sizeof(Embarcadero::MessageHeader), sealed));
+	EXPECT_EQ(bounded.PublishedMessages(), 0u);
+	EXPECT_EQ(bounded.SealAll(), 1u);
+	EXPECT_EQ(bounded.PublishedMessages(), 1u);
+	auto* queued = bounded.Read(0);
+	ASSERT_NE(queued, nullptr);
+	bounded.ReleaseBatch(queued);
+
+	setenv(key, "1048576", 1);
+	QueueBuffer impossible(/*num_buf=*/16, /*num_threads_per_broker=*/4,
+	                       /*client_id=*/28, /*message_size=*/4096,
+	                       Embarcadero::kOrderStrong);
+	EXPECT_FALSE(impossible.AddBuffers(0));
+	EXPECT_EQ(impossible.PoolBytes(), 0u);
+}
+
 TEST(Order5PublisherRolloverTest, PauseRolloverSerializesProducerExit) {
 	setenv("EMBAR_USE_HUGETLB", "0", 1);
 	QueueBuffer queue(/*num_buf=*/1, /*num_threads_per_broker=*/1, /*client_id=*/23,
@@ -653,4 +697,14 @@ TEST(Order5PublisherRollover, AckWaitUsesAuthoritativeFrontierAndLegacyNormalize
         EXPECT_EQ(stopped.wait_for(500ms), std::future_status::ready);
         EXPECT_FALSE(stopped.get());
     }
+}
+
+TEST(Order5PublisherRollover, PollRejectsAckFrontierBeyondPublishedTarget) {
+    char topic[TOPIC_NAME_SIZE] = "AckOvershoot";
+    Publisher publisher(topic, "127.0.0.1", "1212", 1, 64, 1 << 20,
+                        Embarcadero::kOrderStrong, heartbeat_system::SequencerType::EMBARCADERO);
+    PublisherTestPeer::ConfigureOrder5Session(publisher, 1);
+    PublisherTestPeer::SetClientOrder(publisher, 3);
+    PublisherTestPeer::AdvanceAck(publisher, true, 4);
+    EXPECT_FALSE(publisher.Poll(3, false));
 }

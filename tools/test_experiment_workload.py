@@ -92,6 +92,9 @@ class WorkloadTests(unittest.TestCase):
 
     def test_ack_uses_authoritative_frontier_and_rejects_wrong_route(self):
         self.assertEqual(work.ack_and_routing(log_for(),256,[0])['raw_ack_diagnostic'],255)
+        shorter = log_for().replace('session_rto_min_ms=60000', 'session_rto_min_ms=10000')
+        self.assertEqual(work.ack_and_routing(shorter,256,[0],10000)['messages'],256)
+        with self.assertRaises(dev.RunError): work.ack_and_routing(shorter,256,[0],60000)
         for log in (log_for().replace('normalized_received=256','normalized_received=255'),
                     log_for(broker=1), log_for().replace('retransmit_attempts=0','retransmit_attempts=1')):
             with self.assertRaises(dev.RunError): work.ack_and_routing(log,256,[0])

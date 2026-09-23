@@ -31,7 +31,7 @@ def finite(row, names):
             raise dev.RunError("missing or nonpositive measurement: " + name)
 
 
-def ack_and_routing(log, count, allowed):
+def ack_and_routing(log, count, allowed, expected_rto_ms=60000):
     ack = re.findall(r"\[ACK_VERIFY\] normalized_received=(\d+) raw_received=(\d+) target=(\d+) 100%", log)
     if len(ack) != 1 or int(ack[0][0]) != count or int(ack[0][2]) != count:
         raise dev.RunError("authoritative ACK frontier did not exactly complete the client workload")
@@ -42,7 +42,7 @@ def ack_and_routing(log, count, allowed):
     row = dict(re.findall(r"(\w+)=([^\s]+)", routing[-1]))
     sent = {int(k[6:-5]): int(v) for k, v in row.items() if re.fullmatch(r"broker\d+_msgs", k)}
     if (int(row['retransmit_attempts']) != 0 or int(row['session_fenced_observed']) != 0 or
-            int(row['session_rto_min_ms']) != 60000 or sum(sent.values()) != count or
+            int(row['session_rto_min_ms']) != expected_rto_ms or sum(sent.values()) != count or
             not set(sent).issubset(set(allowed))):
         raise dev.RunError("routing escaped its allowed brokers, retried, fenced, or lost messages")
     if re.search(r"ACK Timeout|status=failed|Subscriber::Poll timeout|\[SESSION_FENCED_OBSERVED\]", log):
@@ -56,9 +56,11 @@ class Workload:
         self.args = args
         self.plans = []
         self.go_ns = None
+        self.expected_rto_ms = 60000
 
     def prepare(self, config, env, selected, manifest, hardware, common, run_dir):
         args = self.args
+        self.expected_rto_ms = int(env.get('EMBARCADERO_SESSION_RTO_MIN_MS', '60000'))
         total = sum(args.payload_bytes)
         reserve = sum(args.message_counts) * (args.message_bytes + 128) + 2 * dev.MIB * common.brokers * args.threads * args.clients
         if reserve >= dev.SEGMENT_BYTES - 4096:
@@ -92,7 +94,7 @@ class Workload:
                     'independent session identities, exact per-client ACK completion and routing; no combined subscriber payload audit')})
         manifest['limitations'] = [value for value in manifest['limitations'] if not value.startswith('RTO floor exceeds')]
         manifest['limitations'].extend([
-            'RTO floor equals the 60-second whole-client deadline; qualification explicitly requires zero retransmissions.',
+            f'RTO floor is {self.expected_rto_ms} ms; qualification explicitly requires zero retransmissions and fences.',
             'No fixed-offered-load latency equivalence, sustained capacity, or multi-host claim.',
             'Broker allowlists select destinations; they do not implement a statistical key-skew distribution.',
             'A sender-gap marker proves delay injection, not that a later batch overtook it.',
@@ -197,7 +199,7 @@ class Workload:
             log = (run_dir / (plan['name'] + '.log')).read_text(errors='replace')
             payload = self.args.payload_bytes[index]
             count = self.args.message_counts[index]
-            result = ack_and_routing(log, count, self.args.allowlists[index])
+            result = ack_and_routing(log, count, self.args.allowlists[index], self.expected_rto_ms)
             if self.args.kind == 'gap':
                 audits = re.findall(r'\[ORDERED_DELIVERY_AUDIT\] status=passed messages=(\d+) expected=(\d+) payload_bytes=(\d+) duplicates=(\d+) parse_errors=(\d+) export_gaps=(\d+) indexed_payload=1\b', log)
                 if audits != [(str(count), str(count), str(payload), '0', '0', '0')]:

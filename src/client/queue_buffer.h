@@ -51,7 +51,7 @@ public:
 	 * Sized for steady-state send-pipeline depth (queues × ~32 slots), capped by
 	 * EMBARCADERO_QUEUE_POOL_MAX_BYTES. Disk ACK2 keeps owned RTO copies so the
 	 * pool tracks send depth only; memory-emulated ACK2 / ACK1 may pin slots
-	 * until ACK and must bound unacked credit by PoolBytes(). Idempotent.
+	 * until ACK and are backpressured by available pool slots. Idempotent.
 	 * @param buf_size Size hint from caller (bytes)
 	 * @return true on success
 	 */
@@ -59,6 +59,11 @@ public:
 
 	/** Allocated hugepage pool size in bytes (0 before AddBuffers). */
 	size_t PoolBytes() const { return pool_slots_ * slot_size_; }
+	/** Unique messages placed on sender queues, including a seal whose Write is
+	 * still blocked acquiring its next pool slot. Recovery uses this frontier. */
+	size_t PublishedMessages() const {
+		return published_messages_.load(std::memory_order_acquire);
+	}
 
 	/**
 	 * Append one message to current batch; round-robins by write_buf_id_. Seals batch when >= BATCH_SIZE.
@@ -195,6 +200,7 @@ private:
 
 	size_t write_buf_id_{0};
 	std::atomic<size_t> batch_seq_{0};
+	std::atomic<size_t> published_messages_{0};
 	// [[CACHE_LINE]] Separate producer-hot (batch_seq_) from consumer-read (write_finished_/shutdown_)
 	// to avoid false sharing: producer fetch_add on batch_seq_ would otherwise invalidate the
 	// cache line that consumers load when Read() returns empty.

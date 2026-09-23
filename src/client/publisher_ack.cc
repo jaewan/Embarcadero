@@ -423,12 +423,10 @@ process_client_fd:;
 						connection_error_or_closed = true; break;
 					}
 
-					const size_t session_global_acked =
-						IsOrder5SessionMode()
-							? SessionGlobalAckFromGeneration(
-								ack_message_base_.load(std::memory_order_acquire),
-								acked_msg)
-							: acked_msg;
+					const size_t session_global_acked = IsOrder5SessionMode()
+						? SessionGlobalAckFromWire(
+							ack_message_base_.load(std::memory_order_acquire), acked_msg)
+						: acked_msg;
 					size_t prev_acked = prev_ack_per_sock[client_sock]; // Assumes key exists
 
 					if (session_global_acked >= prev_acked || prev_acked == (size_t)-1) { // Check for valid cumulative value
@@ -817,4 +815,3 @@ void Publisher::WritePublishLatencyResults() {
 	}
 }
 #endif
-
