@@ -13,7 +13,7 @@ Other research modes remain governed by the [support matrix](../support-matrix.m
 | PR03–09: geometry, retention, capacity, sessions, transport, topic containment, baselines | Delivered to the bounded contract and tested as described in the closure audit. The epoch-seal scanner race was fixed at `f754c906` with a failing-before/passing-after concurrent regression. | No log recycling, multi-topic admission, physical writer fencing, or general crash-stable recovery. |
 | PR10: production extraction and performance nonregression | Extraction delivered. Ten paired four-broker local real-CXL runs measured fixed/old geometric throughput ratio 0.99991 (95% interval 0.9816–1.0186). | Supports maintained throughput only for the tested local profile. One-broker primary ACK throughput remains statistically inconclusive. |
 | PR11: shared experiment tooling | Supported local routes and one parameterized, owned remote CXL transfer route delivered. Historical full matrices and remote machine provisioning are not migrated. | The remote route records client/configuration hashes and executed identities, but binary hashes alone do not attest the native client source revision. |
-| PR12: open-source release | Apache-2.0 foundation, documentation, CI definition, local clean bootstrap, finite CXL correctness/performance evidence, and scoped claims exist. | Branch integration, hosted CI evidence, remote-source provenance, broader reliability and research-mode qualification remain open. |
+| PR12: open-source release | Apache-2.0 foundation, documentation, CI definition, local clean bootstrap, finite CXL correctness/performance evidence, and scoped claims exist. | Branch integration, hosted CI evidence, automated native-source attestation for future remote builds, broader reliability and research-mode qualification remain open. |
 
 Real CXL returned as memory-only NUMA node 2. The earlier statement that CXL
 hardware was unavailable no longer applies. The
@@ -69,6 +69,13 @@ revision `cb122898`; the one case that ran while documentation and the remote
 harness were being edited was repeated and passed at clean revision `33e503a8`.
 The generated case manifests are under
 `/home/domin/Embarcadero/results/cxl-release-checkpoint/faults/`.
+
+The final `0cf30e04` cleanup removed whitespace from extracted publisher
+units. Rebuilding `throughput_test` produced the **same SHA-256**
+`1e025ae3c9ca30f0d575490026c455652c95ee66491c16f13d17551c576cccc6`;
+the broker remained byte-identical at SHA-256
+`db1559d22829e644c1f9ee4510e1f8c7e3bedf1098e49204ffae4e3d45ab9532`.
+The cumulative diff from `origin/main` passes `git diff --check`.
 
 The next release actions are concrete:
 
