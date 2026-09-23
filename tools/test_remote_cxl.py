@@ -2,6 +2,8 @@
 """Remote profile preflight and validation; never connects to a remote host."""
 
 from pathlib import Path
+import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -87,6 +89,25 @@ class RemoteProfileTests(unittest.TestCase):
                     f"session_rto_min_ms=60000 broker0_msgs={dev.GIB//4096}\n")
             with self.assertRaisesRegex(dev.RunError, "HugeTLB mapping was not confirmed"):
                 workload.validate(base)
+
+    def test_cleanup_refuses_unowned_path_and_waits_for_exact_child(self):
+        options, _, local = self.options()
+        workload = remote.RemotePublishers(options, local)
+        p = options.publisher[0]
+        workload.directories[p.host] = "/tmp/unrelated"
+        with self.assertRaisesRegex(dev.RunError, "refusing cleanup"):
+            workload.cleanup(p)
+        directory = f"/tmp/embarcadero-cxl-{os.getuid()}-abcdefgh"
+        workload.directories[p.host] = directory
+        with mock.patch.object(remote, "ssh", return_value="") as transport:
+            workload.cleanup(p)
+        script = transport.call_args.args[1]
+        self.assertIn("readlink /proc/$pid/exe", script)
+        self.assertIn("kill -TERM $pid", script)
+        self.assertIn("kill -KILL $pid", script)
+        self.assertIn("rm -rf -- " + directory, script)
+        self.assertEqual(subprocess.run(["sh", "-n"], input=script, text=True,
+                                        capture_output=True).returncode, 0)
 
 
 if __name__ == "__main__":

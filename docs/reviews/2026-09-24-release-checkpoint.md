@@ -16,8 +16,8 @@ Other research modes remain governed by the [support matrix](../support-matrix.m
 | PR12: open-source release | Apache-2.0 foundation, documentation, CI definition, local clean bootstrap, finite CXL correctness/performance evidence, and scoped claims exist. | Branch integration, hosted CI evidence, remote-source provenance, broader reliability and research-mode qualification remain open. |
 
 Real CXL returned as memory-only NUMA node 2. The earlier statement that CXL
-hardware was unavailable no longer applies. The [paired local campaign]
-(2026-09-23-cxl-before-after.md) passed 30/30 fixed-broker 10 GiB zero-stall
+hardware was unavailable no longer applies. The
+[paired local campaign](2026-09-23-cxl-before-after.md) passed 30/30 fixed-broker 10 GiB zero-stall
 trials across its two campaigns, but zero in thirty gives only an approximate
 9.5% one-sided 95% upper failure-rate bound under independent identical trials.
 The demonstrated epoch-seal race was pre-existing in the retained baseline;
@@ -46,6 +46,27 @@ The local manifest is at
 `/home/domin/Embarcadero/results/cxl-release-checkpoint/embarcadero-dev-1002-uc3lpdvn/manifest.json`;
 generated results are intentionally not committed. This is one finite
 qualification observation, not a new old/new estimate or paper reproduction.
+
+The c1/c3 client source archives have identical SHA-256
+`9674aa5c13cf282579354b52ccffd46c64405edc7ed91be38299bd06d3064193`.
+Comparing all 1,806 regular archive members with `git archive f754c906`
+found one differing review document and no changed source/build files. Every
+archived file matched its extracted native-build source tree on both hosts;
+their CMake caches name those trees and `Release` with native architecture.
+The executed client hashes matched the copied binaries. This establishes
+source-snapshot continuity for these clients, while independent compiler
+attestation remains outside the prototype's evidence. The generated audit
+record is `/home/domin/Embarcadero/results/cxl-release-checkpoint/native-source-provenance.json`.
+
+An exact-source fault-enabled Debug build completed all **23/23** owned DRAM
+fault cases, including ACK publication, session reopen, finite BLog/GOI
+capacity, and rollover retention. Every case reported normal owned cleanup
+with no forced shutdown. The same fault binary hash was checked against the
+executed process in each manifest. Twenty-two cases recorded clean source
+revision `cb122898`; the first case ran while only documentation and the
+remote harness were being edited, and is being rerun after the final commit.
+The generated case manifests are under
+`/home/domin/Embarcadero/results/cxl-release-checkpoint/faults/`.
 
 The next release actions are concrete:
 

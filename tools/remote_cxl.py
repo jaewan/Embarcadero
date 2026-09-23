@@ -159,7 +159,7 @@ class RemotePublishers:
 
     def setup(self, p):
         directory = ssh(p.host, f"mktemp -d /tmp/embarcadero-cxl-{os.getuid()}-XXXXXXXX")
-        if not DIR_RE.fullmatch(directory):
+        if not DIR_RE.fullmatch(directory) or not directory.startswith(f"/tmp/embarcadero-cxl-{os.getuid()}-"):
             raise dev.RunError(p.host + ": unexpected private directory")
         self.directories[p.host] = directory
         quoted = shlex.quote(directory)
@@ -246,6 +246,8 @@ class RemotePublishers:
         directory = self.directories.get(p.host)
         if not directory:
             return
+        if not DIR_RE.fullmatch(directory) or not directory.startswith(f"/tmp/embarcadero-cxl-{os.getuid()}-"):
+            raise dev.RunError(p.host + ": refusing cleanup outside an owned private directory")
         quoted = shlex.quote(directory)
         if p.host in self.launched:
             # An SSH transport may fail between process launch and PID-file
@@ -257,12 +259,22 @@ class RemotePublishers:
                 time.sleep(0.1)
             else:
                 raise dev.RunError(p.host + ": launched client has no owned PID file; retained " + directory)
+        expected = shlex.quote(directory + "/throughput_test")
         script = (f"if test -f {quoted}/client.pid; then pid=$(cat {quoted}/client.pid); "
                   "case $pid in *[!0-9]*|'') exit 2;; esac; "
                   "if test -e /proc/$pid/exe; then "
                   "actual=$(readlink /proc/$pid/exe); "
-                  f"test \"$actual\" = {shlex.quote(directory + '/throughput_test')} || exit 3; "
-                  "kill -TERM $pid; fi; fi; "
+                  f"test \"$actual\" = {expected} || exit 3; "
+                  "kill -TERM $pid; attempts=0; "
+                  "while test -e /proc/$pid/exe && "
+                  f"test \"$(readlink /proc/$pid/exe)\" = {expected} && "
+                  "test $attempts -lt 30; do sleep 0.1; attempts=$((attempts + 1)); done; "
+                  "if test -e /proc/$pid/exe && "
+                  f"test \"$(readlink /proc/$pid/exe)\" = {expected}; then "
+                  "kill -KILL $pid; sleep 0.1; fi; "
+                  "if test -e /proc/$pid/exe && "
+                  f"test \"$(readlink /proc/$pid/exe)\" = {expected}; then exit 4; fi; "
+                  "fi; fi; "
                   f"rm -rf -- {quoted}")
         ssh(p.host, script, timeout=20)
 
