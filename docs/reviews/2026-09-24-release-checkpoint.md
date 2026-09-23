@@ -36,14 +36,16 @@ the host NIC received 11.95 GB/s over its busiest 0.5-second interval versus
 steady receive ceiling on that setup, not proof of global implementation
 optimality.
 
-The new `tools/remote_cxl.py` profile was run from clean revision `0476e2ed`
+The new `tools/remote_cxl.py` profile was run from clean revision `33e503a8`
 with two remote native Intel clients (c1/c3), both on the verified 9000-byte
 test path and HugeTLB pools. Its 10 GiB ORDER5/ACK1/RF0 run passed exact
 1,310,720 ACKs per client, all four routes, zero retry/fence, matching
 `/proc` executable digests, real node-2 placement, normal process exit, and
-owned cleanup. Approximate client-clock completion was **9.851 decimal GB/s**.
+owned cleanup. Its stricter final validator also confirmed one successful
+HugeTLB mapping per client, the same go-barrier timestamp, and distinct
+publisher sessions. Approximate client-clock completion was **9.851 decimal GB/s**.
 The local manifest is at
-`/home/domin/Embarcadero/results/cxl-release-checkpoint/embarcadero-dev-1002-uc3lpdvn/manifest.json`;
+`/home/domin/Embarcadero/results/cxl-release-checkpoint/embarcadero-dev-1002-a94_olkr/manifest.json`;
 generated results are intentionally not committed. This is one finite
 qualification observation, not a new old/new estimate or paper reproduction.
 
@@ -63,8 +65,8 @@ fault cases, including ACK publication, session reopen, finite BLog/GOI
 capacity, and rollover retention. Every case reported normal owned cleanup
 with no forced shutdown. The same fault binary hash was checked against the
 executed process in each manifest. Twenty-two cases recorded clean source
-revision `cb122898`; the first case ran while only documentation and the
-remote harness were being edited, and is being rerun after the final commit.
+revision `cb122898`; the one case that ran while documentation and the remote
+harness were being edited was repeated and passed at clean revision `33e503a8`.
 The generated case manifests are under
 `/home/domin/Embarcadero/results/cxl-release-checkpoint/faults/`.
 
