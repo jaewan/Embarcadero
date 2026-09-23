@@ -145,61 +145,66 @@ TEST_F(Phase2Test, GOISequentialIndexing) {
     }
 }
 
-// Test 2: Replica Polling (No Spinning)
-TEST_F(Phase2Test, ReplicaPollingNoSpin) {
+// Test 2: a replica must read GOI entries only after their prefix is published.
+TEST_F(Phase2Test, ReplicaPollingRespectsCommittedPrefix) {
     constexpr int NUM_BATCHES = 50;
-    std::atomic<uint64_t> batch_counter{0};
-    std::atomic<bool> sequencer_done{false};
+    control_block_->committed_seq.store(UINT64_MAX, std::memory_order_relaxed);
 
     // Sequencer thread: writes batches to GOI
     std::thread sequencer([&]() {
         for (int i = 0; i < NUM_BATCHES; i++) {
-            uint64_t batch_idx = batch_counter.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t batch_idx = static_cast<uint64_t>(i);
             GOIEntry* entry = &goi_[batch_idx];
-            entry->global_seq = batch_idx;
             entry->batch_id = (1ULL << 48) | i;
             entry->broker_id = 1;
             entry->total_order = i * 100;
             entry->message_count = 100;
             entry->pbr_index = i;
             entry->num_replicated.store(0, std::memory_order_release);
+            entry->global_seq = batch_idx;
+            // Match the production reader's committed-prefix gate: all entry
+            // fields become visible before this index can be consumed.
+            control_block_->committed_seq.store(batch_idx, std::memory_order_release);
 
             // Simulate write latency
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
-        sequencer_done.store(true, std::memory_order_release);
     });
 
     // Replica thread: polls GOI sequentially
-    std::atomic<uint64_t> next_goi_index{0};
-    std::atomic<int> batches_processed{0};
-    std::atomic<int> spin_count{0};
+    int batches_processed = 0;
+    bool valid_entries = true;
+    bool timed_out = false;
 
     std::thread replica([&]() {
-        while (batches_processed.load() < NUM_BATCHES) {
-            uint64_t goi_index = next_goi_index.load(std::memory_order_relaxed);
-            GOIEntry* entry = &goi_[goi_index];
-
-            // Check if sequencer has written this entry
-            if (entry->global_seq != goi_index) {
-                spin_count.fetch_add(1, std::memory_order_relaxed);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (batches_processed < NUM_BATCHES) {
+            const uint64_t goi_index = static_cast<uint64_t>(batches_processed);
+            const uint64_t committed = control_block_->committed_seq.load(std::memory_order_acquire);
+            if (committed == UINT64_MAX || goi_index > committed) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    timed_out = true;
+                    break;
+                }
                 std::this_thread::yield();
                 continue;
             }
-
-            // Process batch
-            batches_processed.fetch_add(1, std::memory_order_relaxed);
-            next_goi_index.fetch_add(1, std::memory_order_relaxed);
+            const GOIEntry* entry = &goi_[goi_index];
+            if (entry->global_seq != goi_index || entry->batch_id != ((1ULL << 48) | goi_index) ||
+                entry->total_order != goi_index * 100 || entry->message_count != 100) {
+                valid_entries = false;
+                break;
+            }
+            ++batches_processed;
         }
     });
 
     sequencer.join();
     replica.join();
 
-    EXPECT_EQ(batches_processed.load(), NUM_BATCHES)
-        << "Replica should process all batches";
-    EXPECT_LT(spin_count.load(), NUM_BATCHES * 100)
-        << "Spin count should be reasonable (not infinite)";
+    EXPECT_FALSE(timed_out) << "Replica did not observe the committed prefix";
+    EXPECT_TRUE(valid_entries) << "Replica observed incomplete GOI fields";
+    EXPECT_EQ(batches_processed, NUM_BATCHES) << "Replica should process all batches";
 }
 
 // Test 3: CV Monotonic Tracking
