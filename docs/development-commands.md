@@ -2,7 +2,8 @@
 
 Start with the [disposable build bootstrap and presets](development-build.md).
 These commands use local clients and explicit DRAM emulation; they do not need
-SSH clients or the absent NUMA node 2. Brokers use node 1 and clients use node 0.
+SSH clients or NUMA node 2. Brokers use node 1 and clients use node 0. Real
+CXL node 2 is currently available and has a separate finite remote profile below.
 
 | Purpose | Command | Evidence |
 |---|---|---|
@@ -14,6 +15,7 @@ SSH clients or the absent NUMA node 2. Brokers use node 1 and clients use node 0
 | Check legacy startup | `python3 tools/experiment.py legacy-startup --build-dir build/debug` | ORDER0/ACK1 startup and completion; no indexed payload audit |
 | Exercise production faults | `python3 tools/experiment.py fault --build-dir build/debug-faults --case all` | All 23 cases, including real client recovery, withheld ACK and repeated rejected connections; separate fault build required |
 | Run a paired broker pilot | `python3 tools/experiment.py perf --help` | Requires separately built baseline/candidate, common audited client and complete paired protocol |
+| Inspect a real-CXL remote transfer | `python3 tools/experiment.py remote-cxl --help` | Parameterized remote publishers, binary hashes, exact ACK/routing and owned cleanup |
 | Analyze retained pilot runs | `python3 tools/experiment.py analyze OUTPUT/index.json --output OUTPUT/analysis.json` | Rejects incomplete or mismatched protocols before qualified comparisons |
 
 `bash scripts/run_experiment.sh PROFILE ...` is an equivalent shell entrypoint.
@@ -114,3 +116,36 @@ See [DRAM development](development-dram.md) for resource limits and fault-build
 commands, [the performance protocol](performance-pilot.md) before comparing
 throughput, and [the support matrix](support-matrix.md) for qualified contracts.
 An emulated run cannot establish real-CXL behavior or persistent-media durability.
+
+## Finite remote CXL profile
+
+`remote-cxl` reuses the owned broker lifecycle. It requires a memory-only NUMA
+node 2, four node-1 brokers, a 96 GiB real-backend mapping, 8 GiB segments,
+and two or three remote publishers with a total payload of at most 16 GiB.
+It only qualifies ORDER5/ACK1/RF0 with 4 KiB messages and exact per-client ACKs;
+it does not audit subscriber payloads. Each remote client has a private temporary
+directory and copied configuration. The runner records preflight and executed
+binary hashes, NUMA placement, dependencies, routing, and owned cleanup.
+
+For a c1/c3 10 GiB check, first build the **same source revision** on each
+client's native host, and confirm its NIC-local NUMA node and test-network
+address. Supply the actual executable paths:
+
+```sh
+python3 tools/experiment.py remote-cxl \
+  --publisher c1,0,5,/absolute/c1/path/throughput_test \
+  --publisher c3,1,5,/absolute/c3/path/throughput_test \
+  --brokers 4 --physical-cxl --head-addr 10.10.10.10 \
+  --build-dir /absolute/local/release-build --dry-run
+```
+
+Remove `--dry-run` after reviewing the manifest. Add `--hugetlb` only when
+every remote client has a suitable HugeTLB pool; `--library HOST=/absolute/path`
+copies a required shared library into that host's private directory. The runner
+does not configure MTU, hugepages, NICs, or system libraries. The caller must
+record remote source/build provenance separately: a binary hash identifies the
+executed artifact but cannot prove the revision that built it. Application
+throughput uses client durations rounded to 0.01 seconds and cross-host wall
+clocks, so subsecond transfers provide only approximate aggregate rates. The
+[real-CXL report](reviews/2026-09-23-real-cxl-performance.md) keeps the earlier
+matched results and hardware differences separate from paper reproduction.

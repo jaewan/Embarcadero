@@ -11,10 +11,13 @@ require the same virtual mapping address because some shared records still
 contain process pointers.
 
 The paper's CXL performance results describe its evaluated snapshot and hardware.
-The refactored code has passed finite local DRAM and NUMA-node-2 correctness checks,
-but its one-broker throughput nonregression and physical-CXL performance remain
-unqualified. See the [supported modes](docs/support-matrix.md),
-[latest paired measurements](docs/reviews/2026-09-23-workload-followup.md), and
+The refactored code has passed finite local DRAM and real NUMA-node-2 CXL checks.
+Ten matched four-broker local CXL pairs found maintained throughput for the tested
+ORDER5/ACK1/RF0 profile; remote comparisons use different publisher hardware and
+do not reproduce the paper's two-client result. Rare-stall frequency and one-broker
+primary-throughput nonregression remain unresolved. See the
+[supported modes](docs/support-matrix.md),
+[real-CXL measurements](docs/reviews/2026-09-23-real-cxl-performance.md), and
 [evidence availability](docs/reviews/evidence/README.md). The manuscript in
 `Paper/Text/` is managed separately and is not part of this checkout.
 

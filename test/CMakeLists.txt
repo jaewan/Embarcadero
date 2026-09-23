@@ -740,6 +740,11 @@ add_test(NAME unit_dev_runner
 set_tests_properties(unit_dev_runner PROPERTIES
     TIMEOUT 30 LABELS "unit;runner;cleanup;correctness")
 
+add_test(NAME unit_remote_cxl_runner
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_remote_cxl.py)
+set_tests_properties(unit_remote_cxl_runner PROPERTIES
+    TIMEOUT 30 LABELS "unit;runner;remote;correctness")
+
 add_test(NAME unit_perf_compare
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_perf_compare.py)
 add_test(NAME unit_perf_analysis

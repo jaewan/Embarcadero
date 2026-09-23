@@ -446,7 +446,7 @@ class SmokeProfile:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build")
-    parser.add_argument("--brokers", type=int, choices=(1, 3), default=1)
+    parser.add_argument("--brokers", type=int, choices=(1, 3, 4), default=1)
     parser.add_argument("--run-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--dry-run", action="store_true", help="write manifest and config; do not spawn brokers or allocate shared memory")
     parser.add_argument("--automatic-mapping", action="store_true",

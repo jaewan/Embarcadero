@@ -2,6 +2,10 @@
 
 Audit started 2026-09-22; updated 2026-09-23. This compares [PR01–12](2026-09-22-refactoring-plan.md) with the delivered source and acceptance evidence. It supplements, rather than rewrites, the historical [completion ledger](2026-09-22-refactoring-completion-plan.md). Current qualification belongs in the [follow-up results](2026-09-22-followup-results.md).
 
+This is a dated audit. Physical CXL was restored after it was written; use the
+[current release checkpoint](2026-09-24-release-checkpoint.md) and
+[real-CXL report](2026-09-23-real-cxl-performance.md) for the present gates.
+
 The owner selected local DRAM development, bounded retention with **no reuse or eviction of replayable data**, and Apache-2.0. Those are resolved scope decisions. Missing physical CXL is a hardware qualification gate. It is not an explanation for unfinished software tests or experiments.
 
 Source 14 passed 53 Release CTest targets, seven linked TSan fixtures and 12 publisher ASan/UBSan tests; three earlier small TSan fixtures remain separately recorded. The manager-level allocator fixture has now passed. All 23 frozen live fault cases and all 52 fixed performance trials passed their runtime checks. Statistical qualification is narrower: one-broker primary ACK throughput remains inconclusive, so overall primary-throughput nonregression is not established. Source 14 also rejects a follower-only ORDER5 ACK configuration exposed by a retained failed workload run, and strengthens running-binary/source provenance. The [follow-up report](2026-09-22-followup-results.md) distinguishes sources, component tests and live results.

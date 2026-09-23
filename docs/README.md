@@ -1,6 +1,8 @@
 # Documentation
 
-The latest refactoring work and qualification are recorded in the
+The current release checkpoint is the
+[September 24 plan review](reviews/2026-09-24-release-checkpoint.md).
+Earlier work and qualification are recorded in the
 [follow-up report](reviews/2026-09-22-followup-results.md), with an explicit
 [original-plan closure audit](reviews/2026-09-22-plan-closure-audit.md).
 Earlier source09 results remain separate historical evidence.
