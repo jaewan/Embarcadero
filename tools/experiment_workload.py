@@ -59,8 +59,8 @@ class Workload:
 
     def prepare(self, config, env, selected, manifest, hardware, common, run_dir):
         args = self.args
-        total = sum(args.payloads) * dev.MIB
-        reserve = total // dev.MESSAGE_BYTES * (dev.MESSAGE_BYTES + 128) + 2 * dev.MIB * common.brokers * args.threads * args.clients
+        total = sum(args.payload_bytes)
+        reserve = sum(args.message_counts) * (args.message_bytes + 128) + 2 * dev.MIB * common.brokers * args.threads * args.clients
         if reserve >= dev.SEGMENT_BYTES - 4096:
             raise dev.RunError("bounded workload can exceed one broker's initial segment")
         required = dev.REGION_BYTES + (2 * common.brokers + 3 * args.clients) * dev.GIB
@@ -75,10 +75,11 @@ class Workload:
         selected.update(EMBARCADERO_LATENCY_ACK_PRIMARY='0', EMBAR_VALIDATE_ORDER='1' if args.kind == 'gap' else '0')
         env.update(selected)
         manifest.update(profile='dev-dram-workload-' + args.kind,
-            application_payload_bytes=total, message_bytes=dev.MESSAGE_BYTES,
+            application_payload_bytes=total, message_bytes=args.message_bytes,
             initial_payload_reservation_upper_bound_bytes=reserve,
             client_deadline_seconds=60, workload={
                 'kind': args.kind, 'independent_client_processes': args.clients,
+                'payload_bytes_per_client': args.payload_bytes, 'message_count_per_client': args.message_counts,
                 'payload_mib_per_client': args.payloads, 'target_mibps_per_client': args.rates,
                 'broker_allowlists': args.allowlists, 'threads_per_broker': args.threads,
                 'steady_rate': args.steady_rate, 'gap_delay_ms': args.gap_ms if args.kind == 'gap' else None,
@@ -105,7 +106,7 @@ class Workload:
             kind = {'gap': 1, 'latency': 2, 'publishers': 5}[args.kind]
             command = binding + [str(binary), '--config', str(config), '--head_addr', '127.0.0.1',
                 '-t', str(kind), '-o', '5', '-a', '1', '-r', '0', '-n', str(args.threads),
-                '-m', str(dev.MESSAGE_BYTES), '-s', str(args.payloads[index] * dev.MIB), '--sequencer', 'EMBARCADERO']
+                '-m', str(args.message_bytes), '-s', str(args.payload_bytes[index]), '--sequencer', 'EMBARCADERO']
             environment = {'EMBARCADERO_DATA_DIR': str(directory / 'results') + '/',
                 'EMBARCADERO_PUBLISH_BROKER_ALLOWLIST': ','.join(map(str, args.allowlists[index]))}
             if args.kind != 'gap':
@@ -194,8 +195,8 @@ class Workload:
         for index, plan in enumerate(self.plans):
             directory = Path(plan['cwd'])
             log = (run_dir / (plan['name'] + '.log')).read_text(errors='replace')
-            payload = self.args.payloads[index] * dev.MIB
-            count = payload // dev.MESSAGE_BYTES
+            payload = self.args.payload_bytes[index]
+            count = self.args.message_counts[index]
             result = ack_and_routing(log, count, self.args.allowlists[index])
             if self.args.kind == 'gap':
                 audits = re.findall(r'\[ORDERED_DELIVERY_AUDIT\] status=passed messages=(\d+) expected=(\d+) payload_bytes=(\d+) duplicates=(\d+) parse_errors=(\d+) export_gaps=(\d+) indexed_payload=1\b', log)
@@ -216,7 +217,7 @@ class Workload:
                     raise dev.RunError('strict latency delivery/UID/order counters did not pass')
                 summary = one_row(directory / 'latency_benchmark_summary.csv')
                 if (int(summary['message_count']) != count or int(summary['total_message_size_bytes']) != payload or
-                        int(summary['message_size_bytes']) != dev.MESSAGE_BYTES or
+                        int(summary['message_size_bytes']) != self.args.message_bytes or
                         float(summary['target_offered_load_mbps']) != self.args.rates[index] or
                         summary['steady_rate'] != str(self.args.steady_rate).lower()):
                     raise dev.RunError('latency summary differs from planned finite workload')
@@ -251,7 +252,11 @@ def parse_args(argv=None):
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument('kind', choices=('latency', 'gap', 'publishers'))
     cli.add_argument('--clients', type=int, choices=range(1, 5), default=None)
-    cli.add_argument('--payload-mib', default='32', help='one value or comma-separated value per client; 1..32 each')
+    cli.add_argument('--payload-mib', default=None, help='one value or comma-separated value per client; 1..32 each')
+    cli.add_argument('--message-bytes', type=int, default=dev.MESSAGE_BYTES,
+                     help='payload bytes per message; default 4096, maximum 1MiB')
+    cli.add_argument('--message-count', default=None,
+                     help='exact messages per client, one or comma-separated; exclusive with --payload-mib')
     cli.add_argument('--target-mibps', default=None, help='one or comma-separated rates; 1..4096, 0 means unpaced publishers')
     cli.add_argument('--client-brokers', default=None, help='semicolon-separated per-client broker lists, e.g. 0;0,1,2')
     cli.add_argument('--threads', type=int, choices=(1, 2), default=None, help='default 1; indexed gap requires 2')
@@ -263,6 +268,8 @@ def parse_args(argv=None):
     cli.add_argument('--run-root', type=Path, default=Path('/tmp'))
     cli.add_argument('--dry-run', action='store_true')
     cli.add_argument('--automatic-mapping', action='store_true')
+    cli.add_argument('--physical-cxl', action='store_true',
+                     help='use the real backend with shared mapping on memory-only NUMA node 2')
     cli.add_argument('--startup-timeout', type=float, default=120)
     cli.add_argument('--shutdown-timeout', type=float, default=15)
     args = cli.parse_args(argv)
@@ -279,12 +286,28 @@ def parse_args(argv=None):
             return result
         except (ValueError, OverflowError):
             cli.error(f'expected one or {args.clients} values in {lower}..{upper}')
-    args.payloads = values(args.payload_mib, 1, 32, int)
+    minimum = 16 if args.kind == 'latency' else 8 if args.kind == 'gap' else 1
+    if not minimum <= args.message_bytes <= dev.MIB:
+        cli.error(f'{args.kind} message size must be {minimum}..{dev.MIB} bytes')
+    if args.message_count is not None and args.payload_mib is not None:
+        cli.error('--message-count and --payload-mib are mutually exclusive')
+    if args.message_count is not None:
+        args.message_counts = values(args.message_count, 1, 262144, int)
+        args.payload_bytes = [count * args.message_bytes for count in args.message_counts]
+        args.payloads = [size / dev.MIB for size in args.payload_bytes]
+    else:
+        args.payloads = values(args.payload_mib or '32', 1, 32, int)
+        args.payload_bytes = [size * dev.MIB for size in args.payloads]
+        if any(size % args.message_bytes for size in args.payload_bytes):
+            cli.error('each payload must be an exact multiple of --message-bytes')
+        args.message_counts = [size // args.message_bytes for size in args.payload_bytes]
+    if any(count > 262144 or size > 32 * dev.MIB for count, size in zip(args.message_counts, args.payload_bytes)):
+        cli.error('each client is limited to 262144 messages and 32MiB payload')
     rate_text = args.target_mibps if args.target_mibps is not None else ('128' if args.kind == 'latency' else '0')
     args.rates = values(rate_text, 0 if args.kind != 'latency' else 1, 4096, float)
     if any(round(rate, 3) != rate for rate in args.rates):
         cli.error('rates support at most three fractional digits, matching the native summary precision')
-    if any(rate and size * 1.04 / rate > 15 for size, rate in zip(args.payloads, args.rates)):
+    if any(rate and (size / dev.MIB) * 1.04 / rate > 15 for size, rate in zip(args.payload_bytes, args.rates)):
         cli.error('planned paced send must fit within 15 seconds of the 60-second client deadline')
     if args.gap_ms is not None and (not 1 <= args.gap_ms <= 10 or args.kind != 'gap'):
         cli.error('gap delay is 1..10ms and applies only to gap')
@@ -310,6 +333,7 @@ def main(argv=None):
               '--startup-timeout', str(args.startup_timeout), '--shutdown-timeout', str(args.shutdown_timeout)]
     if args.dry_run: common.append('--dry-run')
     if args.automatic_mapping: common.append('--automatic-mapping')
+    if args.physical_cxl: common.append('--physical-cxl')
     return dev.main(common, profile=dev.SmokeProfile(name='dev-dram-workload-' + args.kind,
         audit_enabled=args.kind == 'gap', validator=workload.validate, workload=workload))
 

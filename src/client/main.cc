@@ -80,6 +80,25 @@ int main(int argc, char* argv[]) {
     int num_brokers_to_kill = result["num_brokers_to_kill"].as<int>();
     std::atomic<int> synchronizer{num_clients};
     int test_num = result["test_number"].as<int>();
+    if (num_threads_per_broker == 0 || num_clients <= 0) {
+        LOG(ERROR) << "Thread and client counts must be positive";
+        return EXIT_FAILURE;
+    }
+    if (message_size == 0 || total_message_size == 0 || total_message_size < message_size ||
+        total_message_size % message_size != 0) {
+        LOG(ERROR) << "Message size and total size must be positive, with total size an exact multiple of message size";
+        return EXIT_FAILURE;
+    }
+    if (test_num == 2 && message_size < sizeof(long long) + sizeof(uint64_t)) {
+        LOG(ERROR) << "Latency messages require at least 16 bytes for timestamp and UID";
+        return EXIT_FAILURE;
+    }
+    const char* validate_order = std::getenv("EMBAR_VALIDATE_ORDER");
+    if (test_num == 1 && order == 5 && validate_order != nullptr &&
+        std::string(validate_order) != "0" && message_size < sizeof(uint64_t)) {
+        LOG(ERROR) << "Indexed ordered-delivery audit requires at least 8 payload bytes";
+        return EXIT_FAILURE;
+    }
     int ack_level = result["ack_level"].as<int>();
     SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
     FLAGS_v = result["log_level"].as<int>();

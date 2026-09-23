@@ -53,6 +53,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_cpu_ranges(self):
         self.assertEqual(runner.cpu_set("0-2,8,10-11"), {0, 1, 2, 8, 10, 11})
+        self.assertEqual(runner.cpu_set(""), set())  # memory-only NUMA node
         with self.assertRaises(ValueError):
             runner.cpu_set("4-1")
 
@@ -265,6 +266,25 @@ print('[ORDERED_DELIVERY_AUDIT] status=passed messages=8192 expected=8192 payloa
                 self.assertIn("--membind=1", command)
             self.assertIn("--membind=0", manifest["client_command"])
             self.assertFalse(Path(manifest["shared_memory"]).exists())
+
+    def test_physical_cxl_dry_run_selects_real_backend_and_node2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build, numactl = self.fake_build(base)
+            with self.fake_host(numactl):
+                code = runner.main(["--build-dir", str(build), "--run-root", str(base),
+                                    "--physical-cxl", "--dry-run"])
+            self.assertEqual(code, 0)
+            run_dir = next(base.glob("embarcadero-dev-*"))
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            config = json.loads((run_dir / "effective-config.yaml").read_text())
+            self.assertEqual(manifest["backend"], "numa2-real-cxl")
+            self.assertTrue(manifest["physical_cxl_requested"])
+            self.assertFalse(manifest["cxl_evidence"])  # dry-run has no placement proof
+            self.assertEqual(config["embarcadero"]["cxl"]["numa_node"], 2)
+            self.assertNotIn("--emul", manifest["broker_commands"][0])
+            self.assertIn("--membind=1,2", manifest["broker_commands"][0])
+            self.assertIn("--membind=0", manifest["client_command"])
 
     def test_legacy_profile_records_same_command_and_environment_it_executes(self):
         with tempfile.TemporaryDirectory() as directory:

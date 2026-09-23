@@ -39,6 +39,8 @@ class RunError(RuntimeError):
 
 def cpu_set(value):
     result = set()
+    if not value.strip():
+        return result
     for part in value.strip().split(","):
         bounds = part.split("-")
         if len(bounds) == 1:
@@ -167,19 +169,21 @@ def child_environment(shm_name, brokers):
     return env, selected, removed
 
 
-def topology():
+def topology(cxl_node=None):
     allowed = os.sched_getaffinity(0)
     result = {"online_nodes": read_optional("/sys/devices/system/node/online"),
               "allowed_cpus": sorted(allowed), "nodes": {}}
-    for node in (0, 1):
+    for node in ((0, 1, cxl_node) if cxl_node is not None else (0, 1)):
         base = Path(f"/sys/devices/system/node/node{node}")
         cpus = read_optional(base / "cpulist")
         memory = read_optional(base / "meminfo")
         if cpus is None or memory is None:
             raise RunError(f"dev-dram-local requires NUMA node {node}")
         usable = sorted(cpu_set(cpus) & allowed)
-        if not usable:
+        if not usable and node != cxl_node:
             raise RunError(f"current CPU affinity excludes NUMA node {node}")
+        if node == cxl_node and usable:
+            raise RunError(f"CXL NUMA node {node} must be memory-only")
         match = re.search(r"MemFree:\s+(\d+) kB", memory)
         result["nodes"][str(node)] = {"cpus": usable,
             "free_bytes": int(match[1]) * 1024 if match else 0,
@@ -191,19 +195,22 @@ def topology():
     return result
 
 
-def memory_preflight(hardware, brokers):
+def memory_preflight(hardware, brokers, cxl_node=None):
     required = REGION_BYTES + (2 * brokers + 2) * GIB
     available = shutil.disk_usage("/dev/shm").free
     if available < REGION_BYTES + GIB:
         raise RunError("/dev/shm needs 65 GiB free for the 64 GiB region and headroom")
-    if hardware["nodes"]["1"]["free_bytes"] < REGION_BYTES + 2 * brokers * GIB:
+    if hardware["nodes"]["1"]["free_bytes"] < (2 * brokers * GIB if cxl_node is not None else REGION_BYTES + 2 * brokers * GIB):
         raise RunError("NUMA node 1 has insufficient free memory for this cluster")
+    if cxl_node is not None and hardware["nodes"][str(cxl_node)]["free_bytes"] < REGION_BYTES + GIB:
+        raise RunError(f"CXL NUMA node {cxl_node} needs 64 GiB plus headroom")
     if hardware["nodes"]["0"]["free_bytes"] < 2 * GIB:
         raise RunError("NUMA node 0 needs at least 2 GiB free for the client")
     status = Path("/proc/self/status").read_text()
     allowed = re.search(r"^Mems_allowed_list:\s*(.*)$", status, re.MULTILINE)
-    if allowed is None or not {0, 1}.issubset(cpu_set(allowed[1])):
-        raise RunError("process/cgroup memory policy excludes NUMA node 0 or 1")
+    required_nodes = {0, 1} | ({cxl_node} if cxl_node is not None else set())
+    if allowed is None or not required_nodes.issubset(cpu_set(allowed[1])):
+        raise RunError("process/cgroup memory policy excludes a required NUMA node")
     soft, _ = resource.getrlimit(resource.RLIMIT_AS)
     if soft != resource.RLIM_INFINITY and soft < REGION_BYTES + 2 * GIB:
         raise RunError("RLIMIT_AS cannot accommodate one broker's shared mapping")
@@ -441,6 +448,8 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="write manifest and config; do not spawn brokers or allocate shared memory")
     parser.add_argument("--automatic-mapping", action="store_true",
                         help="exercise production head-selected mapping and follower descriptor agreement")
+    parser.add_argument("--physical-cxl", action="store_true",
+                        help="bind the real-backend shared mapping to memory-only NUMA node 2")
     parser.add_argument("--startup-timeout", type=float, default=120)
     parser.add_argument("--shutdown-timeout", type=float, default=10)
     args = parser.parse_args(argv)
@@ -458,7 +467,8 @@ def main(argv=None, *, profile=None):
     args = parse_args(argv)
     run_dir = Path(tempfile.mkdtemp(prefix=f"embarcadero-dev-{os.getuid()}-", dir=args.run_root)).resolve()
     print(f"Run artifacts: {run_dir}", flush=True)
-    manifest = {"profile": profile.name, "backend": "dram-emulation", "cxl_evidence": False,
+    manifest = {"profile": profile.name, "backend": "numa2-real-cxl" if args.physical_cxl else "dram-emulation",
+                "physical_cxl_requested": args.physical_cxl, "cxl_evidence": False,
                 "run_dir": str(run_dir), "status": "preflight", "brokers": args.brokers,
                 "order": profile.order, "audit_enabled": profile.audit_enabled,
                 "ack": 1, "replication_factor": 0, "persistence": "none",
@@ -468,7 +478,7 @@ def main(argv=None, *, profile=None):
                 "client_deadline_seconds": 30, "startup_timeout_seconds": args.startup_timeout,
                 "shutdown_timeout_seconds": args.shutdown_timeout,
                 "limitations": ["fixed-port profile serialized per user; other users/legacy launchers do not take this lock",
-                                "smoke only; not sustained throughput or CXL hardware evidence",
+                                "smoke only; not sustained throughput or a physical CXL performance claim",
                                 "RTO floor exceeds client deadline; disconnect retry bounds remain a runtime responsibility"]}
     owned = None
     run_lock = None
@@ -479,9 +489,9 @@ def main(argv=None, *, profile=None):
     exit_code = 1
     old_handlers = {}
     try:
-        hardware = topology()
+        hardware = topology(2 if args.physical_cxl else None)
         manifest["hardware"] = hardware
-        manifest["memory"] = memory_preflight(hardware, args.brokers)
+        manifest["memory"] = memory_preflight(hardware, args.brokers, 2 if args.physical_cxl else None)
         broker = args.build_dir.resolve() / "bin/embarlet"
         client = args.build_dir.resolve() / "bin/throughput_test"
         numactl = shutil.which("numactl")
@@ -491,6 +501,11 @@ def main(argv=None, *, profile=None):
             if not os.access(binary, os.X_OK):
                 raise RunError("missing executable: " + str(binary))
         config = effective_config(args.brokers)
+        if args.physical_cxl:
+            config["embarcadero"]["cxl"]["numa_node"] = 2
+            dax_path = Path(config["embarcadero"]["cxl"]["device_path"])
+            if dax_path.exists():
+                raise RunError("--physical-cxl owned placement check currently requires the NUMA-2 shared-memory fallback; DAX device exists: " + str(dax_path))
         config_path = run_dir / "effective-config.yaml"
         write_json(config_path, config)  # JSON is valid YAML, accepted by yaml-cpp.
         env, selected, removed = child_environment(shm_name, args.brokers)
@@ -510,11 +525,12 @@ def main(argv=None, *, profile=None):
         manifest.update(source_provenance(ROOT))
         def binding(node):
             cpus = hardware["nodes"][str(node)]["cpus"]
-            return [numactl, "--physcpubind=" + ",".join(map(str, cpus)), f"--membind={node}"]
+            memory_nodes = "1,2" if node == 1 and args.physical_cxl else str(node)
+            return [numactl, "--physcpubind=" + ",".join(map(str, cpus)), f"--membind={memory_nodes}"]
         commands = []
         for broker_id in range(args.brokers):
             role = ["--head"] if broker_id == 0 else ["--follower", f"127.0.0.1:{CONTROL_PORT}"]
-            commands.append(binding(1) + [str(broker), "--emul", "--config", str(config_path)] + role)
+            commands.append(binding(1) + [str(broker)] + ([] if args.physical_cxl else ["--emul"]) + ["--config", str(config_path)] + role)
         client_command = binding(0) + [str(client), "--config", str(config_path), "--head_addr", "127.0.0.1",
             "-t", "1", "-o", str(profile.order), "-a", "1", "-r", "0", "-n", "1", "-m", str(MESSAGE_BYTES),
             "-s", str(PAYLOAD_BYTES), "--sequencer", "EMBARCADERO"]
@@ -556,7 +572,16 @@ def main(argv=None, *, profile=None):
                 evidence = manifest["executed_broker_binaries"].setdefault(name, {})
                 verify_executed_binary(child, broker, manifest["binaries"][str(broker)], evidence)
                 manifest["placement"][name] = placement_snapshot(child,
-                    hardware["nodes"]["1"]["cpus"], 1, run_dir, name, shm_name if broker_id == 0 else None)
+                    hardware["nodes"]["1"]["cpus"], 2 if args.physical_cxl else 1,
+                    run_dir, name, shm_name if broker_id == 0 else None)
+                if args.physical_cxl and broker_id == 0:
+                    broker_log = (run_dir / f"{name}.log").read_text(errors="replace")
+                    if "CXL region bound to NUMA node 2" not in broker_log:
+                        raise RunError("real backend did not report successful NUMA-2 binding")
+                    manifest["cxl_evidence"] = True
+                    manifest["cxl_placement_scope"] = (
+                        "real-backend shared mapping resident on memory-only NUMA node 2; "
+                        "PCI device identity is not established by this runner")
             if args.automatic_mapping:
                 manifest["mapping_bases"] = {}
                 for broker_id in range(args.brokers):

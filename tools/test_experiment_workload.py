@@ -56,9 +56,31 @@ class WorkloadTests(unittest.TestCase):
                      ('latency','--target-mibps','128.1234'),
                      ('publishers','--clients','2','--client-brokers','0'),
                      ('publishers','--client-brokers','0;4'), ('gap','--gap-ms','11'),
-                     ('gap','--threads','1'), ('latency','--gap-ms','1'), ('publishers','--target-mibps','')]:
+                     ('gap','--threads','1'), ('latency','--gap-ms','1'), ('publishers','--target-mibps',''),
+                     ('latency','--message-bytes','15'), ('gap','--message-bytes','7'),
+                     ('publishers','--message-bytes','0'), ('publishers','--message-bytes','1048577'),
+                     ('latency','--message-count','0'), ('latency','--message-count','262145'),
+                     ('latency','--message-count','256','--payload-mib','1'),
+                     ('publishers','--message-count','40000','--message-bytes','1024')]:
             with self.subTest(args=args), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
                 work.parse_args(list(args))
+
+    def test_exact_small_message_plan_and_sub_mib_accounting(self):
+        item = self.workload('latency', '--message-bytes', '16', '--message-count', '256')
+        self.assertEqual(item.args.payload_bytes, [4096])
+        self.assertEqual(item.args.message_counts, [256])
+        self.assertEqual(item.plans[0]['command'][item.plans[0]['command'].index('-m') + 1], '16')
+        self.assertEqual(item.plans[0]['command'][item.plans[0]['command'].index('-s') + 1], '4096')
+        config=dev.effective_config(1); env={}; selected={}
+        manifest={'memory':{'cgroup_limits':[]},'limitations':[]}
+        item.prepare(config,env,selected,manifest,{'nodes':{'0':{'free_bytes':3*dev.GIB}}},mock.Mock(brokers=1),self.directory)
+        self.assertEqual(manifest['application_payload_bytes'],4096)
+        self.assertEqual(manifest['workload']['message_count_per_client'],[256])
+
+    def test_physical_cxl_option_reaches_owned_runner(self):
+        with mock.patch.object(dev, 'main', return_value=0) as lifecycle:
+            self.assertEqual(work.main(['gap', '--physical-cxl']), 0)
+        self.assertIn('--physical-cxl', lifecycle.call_args.args[0])
 
     def test_follower_only_ack_route_rejected_before_owned_lifecycle(self):
         for kind, routes in [('latency', '1,2'), ('gap', '1'), ('publishers', '0;1,2')]:

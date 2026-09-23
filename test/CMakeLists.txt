@@ -808,6 +808,11 @@ add_test(NAME unit_experiment_workload
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_experiment_workload.py)
 set_tests_properties(unit_experiment_workload PROPERTIES
     TIMEOUT 30 LABELS "unit;runner;workload;correctness")
+add_test(NAME unit_client_cli_validation
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_client_cli_validation.py
+        $<TARGET_FILE:throughput_test> ${PROJECT_SOURCE_DIR}/config/client.yaml)
+set_tests_properties(unit_client_cli_validation PROPERTIES
+    TIMEOUT 15 LABELS "unit;client;workload;correctness")
 add_test(NAME unit_fault_packet_parser
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_fault_control.py)
 set_tests_properties(unit_fault_packet_parser PROPERTIES TIMEOUT 10 LABELS "unit;fault-control;correctness")

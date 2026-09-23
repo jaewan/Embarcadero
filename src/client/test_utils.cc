@@ -2131,8 +2131,8 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		double pub_seconds = std::chrono::duration<double>(pub_end - start).count();
 		double e2e_seconds = std::chrono::duration<double>(end - start).count();
 
-		double pubBandwidthMbps = (total_message_size / (1024 * 1024)) / pub_seconds;
-		double e2eBandwidthMbps = (total_message_size / (1024 * 1024)) / e2e_seconds;
+		double pubBandwidthMbps = (static_cast<double>(total_message_size) / (1024.0 * 1024.0)) / pub_seconds;
+		double e2eBandwidthMbps = (static_cast<double>(total_message_size) / (1024.0 * 1024.0)) / e2e_seconds;
 		double offered_seconds = std::chrono::duration<double>(publish_dispatch_end - pace_start).count();
 		double achieved_offered_mbps = offered_seconds > 0.0
 			? (static_cast<double>(offered_bytes) / (1024.0 * 1024.0)) / offered_seconds
