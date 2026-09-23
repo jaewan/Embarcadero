@@ -149,7 +149,7 @@ struct ClientEmitTracker {
 
 // [[PHASE_1B]] Epoch buffer state machine to prevent concurrent merge/write.
 struct alignas(64) EpochBuffer5 {
-	enum class State : uint32_t { IDLE, RESETTING, COLLECTING, SEALED };
+	enum class State : uint32_t { IDLE, RESETTING, COLLECTING, SEALING, SEALED };
 
 	// [[OPT-B]] Per-broker queue with its own lock.
 	// Replaces a single shared data_mu that serialised all BrokerScannerWorker5
@@ -175,27 +175,13 @@ struct alignas(64) EpochBuffer5 {
 	bool enter_collection(int broker_id) {
 		if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return false;
 
-		State cur = state.load(std::memory_order_acquire);
-		if (cur != State::COLLECTING) return false;
-
+		// Admission and the COLLECTING -> SEALING transition share one lock.
+		// A release-store of broker_active followed by a separate state recheck
+		// does not prevent the sealer from missing that store and exposing a
+		// drainable buffer before this scanner has enqueued its batch.
+		std::lock_guard<std::mutex> lk(seal_mutex);
+		if (state.load(std::memory_order_acquire) != State::COLLECTING) return false;
 		broker_active[broker_id].store(true, std::memory_order_release);
-
-		// Double-check state after marking active (prevent race where state changed)
-		if (state.load(std::memory_order_acquire) != State::COLLECTING) {
-			broker_active[broker_id].store(false, std::memory_order_release);
-			// [[OPT-C]] Notify only when this scanner was the last active one.
-			// Checking all flags under seal_mutex avoids a spurious wakeup storm
-			// while keeping the correct quiesce signal for seal().
-			bool any_active = false;
-			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
-				if (broker_active[i].load(std::memory_order_acquire)) { any_active = true; break; }
-			}
-			if (!any_active) {
-				std::lock_guard<std::mutex> lk(seal_mutex);
-				seal_cv.notify_all();
-			}
-			return false;
-		}
 		return true;
 	}
 
@@ -219,26 +205,27 @@ struct alignas(64) EpochBuffer5 {
 		}
 	}
 
-	bool seal() {
+	bool seal(std::chrono::milliseconds wait_budget = std::chrono::milliseconds(10)) {
+		std::unique_lock<std::mutex> lk(seal_mutex);
 		State expected = State::COLLECTING;
-		if (!state.compare_exchange_strong(expected, State::SEALED, std::memory_order_acq_rel)) {
+		if (!state.compare_exchange_strong(expected, State::SEALING, std::memory_order_acq_rel)) {
 			return false;
 		}
-		std::unique_lock<std::mutex> lk(seal_mutex);
-		constexpr auto kSealWaitBudget = std::chrono::milliseconds(10);
-		bool quiesced = seal_cv.wait_for(lk, kSealWaitBudget, [this] {
+		bool quiesced = seal_cv.wait_for(lk, wait_budget, [this] {
 			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 				if (broker_active[i].load(std::memory_order_acquire)) return false;
 			}
 			return true;
 		});
 		if (!quiesced) {
-			// Liveness-first rollback: avoid permanent SEALED dead zone when a collector
-			// flag gets stuck. Driver/scanners will retry sealing.
+			// The admitted scanner still owns its batch. It may finish after this
+			// timeout; keep the buffer collecting and let a later seal retry.
 			state.store(State::COLLECTING, std::memory_order_release);
 			seal_cv.notify_all();
 			return false;
 		}
+		// Only this final state is visible to the sequencer and recovery paths.
+		state.store(State::SEALED, std::memory_order_release);
 		return true;
 	}
 

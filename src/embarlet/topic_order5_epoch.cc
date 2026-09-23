@@ -317,6 +317,7 @@ void Topic::EpochDriverThread() {
 								case EpochBuffer5::State::IDLE: return "IDLE";
 								case EpochBuffer5::State::RESETTING: return "RESETTING";
 								case EpochBuffer5::State::COLLECTING: return "COLLECTING";
+								case EpochBuffer5::State::SEALING: return "SEALING";
 								case EpochBuffer5::State::SEALED: return "SEALED";
 							}
 							return "UNKNOWN";
@@ -504,6 +505,7 @@ void Topic::EpochSequencerThread() {
 				case EpochBuffer5::State::IDLE: return "IDLE";
 				case EpochBuffer5::State::RESETTING: return "RESETTING";
 				case EpochBuffer5::State::COLLECTING: return "COLLECTING";
+				case EpochBuffer5::State::SEALING: return "SEALING";
 				case EpochBuffer5::State::SEALED: return "SEALED";
 			}
 			return "UNKNOWN";
@@ -834,12 +836,8 @@ void Topic::EpochSequencerThread() {
 			CXL::cpu_pause();
 			continue;
 		}
-		// [[EPOCH_BUFFER_LOSS_FIX]] seal() publishes SEALED *before* its collector quiesce
-		// wait completes, so a scanner that already passed enter_collection() may still be
-		// about to push. Draining before those collectors exit loses their batches (the
-		// buffer is drained, the late push lands in it, and the next reset_and_start()
-		// wipes it). Consume only once no collector is active; new collectors cannot enter
-		// a SEALED buffer, and stragglers hold broker_active until after their push.
+		// SEALED is published only after admitted scanners finish. Keep this
+		// ownership check as a defensive invariant before extracting the epoch.
 		{
 			bool collectors_active = false;
 			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
@@ -1180,9 +1178,7 @@ void Topic::EpochSequencerThread() {
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
 			continue;
 		}
-		// [[EPOCH_BUFFER_LOSS_FIX]] Same quiesce requirement as the main consume loop:
-		// do not drain a SEALED buffer while a collector is still active (its push would
-		// land in a drained buffer and be wiped by the next reset_and_start()).
+		// Same defensive quiescence check as the main extraction path.
 		{
 			bool collectors_active = false;
 			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {

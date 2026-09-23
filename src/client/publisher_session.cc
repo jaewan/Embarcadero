@@ -551,6 +551,29 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		session_trim_committed_valid_ = false;
 		unacked_cv_.notify_all();
 	}
+	// A fence report identifies the first sequence the head could not commit.
+	// The retained record exists only after the client finished sending the
+	// batch. Diagnose that boundary without logging on the publish hot path.
+	const uint64_t missing_seq = fenced.has_committed_prefix() ? release_hwm + 1 : 0;
+	const auto missing_it = std::lower_bound(
+		suffix.begin(), suffix.end(), missing_seq,
+		[](const UnackedBatch& rec, uint64_t seq) {
+			return rec.original_batch_seq < seq;
+		});
+	const bool missing_retained =
+		missing_it != suffix.end() && missing_it->original_batch_seq == missing_seq;
+	LOG(WARNING) << "[SESSION_FENCE_PREDECESSOR]"
+	             << " old_epoch=" << old_epoch
+	             << " missing_batch_seq=" << missing_seq
+	             << " retained_after_send=" << (missing_retained ? 1 : 0)
+	             << " sent_age_ms="
+	             << (missing_retained
+	                     ? std::max<int64_t>(0, SteadyNowNs() - missing_it->last_send_ns) / 1000000
+	                     : -1)
+	             << " broker_id=" << (missing_retained ? missing_it->broker_id : -1)
+	             << " suffix_first_seq=" << (suffix.empty() ? 0 : suffix.front().original_batch_seq)
+	             << " suffix_last_seq=" << (suffix.empty() ? 0 : suffix.back().original_batch_seq)
+	             << " suffix_batches=" << suffix.size();
 	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=suffix_collected"
 	             << " suffix_batches=" << suffix.size()
 	             << " committed_messages=" << locally_committed_msgs;

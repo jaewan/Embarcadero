@@ -589,6 +589,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 						case EpochBuffer5::State::IDLE: return "IDLE";
 						case EpochBuffer5::State::RESETTING: return "RESETTING";
 						case EpochBuffer5::State::COLLECTING: return "COLLECTING";
+						case EpochBuffer5::State::SEALING: return "SEALING";
 						case EpochBuffer5::State::SEALED: return "SEALED";
 					}
 					return "UNKNOWN";

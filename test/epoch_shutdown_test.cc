@@ -1,6 +1,8 @@
 #include "embarlet/topic.h"
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 static void Check(bool ok) { if (!ok) throw std::runtime_error("epoch shutdown invariant"); }
 
@@ -47,6 +49,48 @@ int main() {
         Check(trailing.enter_collection(0));
         trailing.exit_collection(0);
         Check(trailing.seal() && trailing.CanDrainAt(next_to_extract, current));
+
+        // A scanner admitted before seal may still be writing its batch. The
+        // sequencer must not see a drainable SEALED buffer until it exits.
+        EpochBuffer5 concurrent;
+        Check(concurrent.reset_and_start());
+        Check(concurrent.enter_collection(1));
+        bool seal_succeeded = false;
+        std::thread sealer([&] { seal_succeeded = concurrent.seal(std::chrono::seconds(2)); });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (concurrent.state.load(std::memory_order_acquire) == EpochBuffer5::State::COLLECTING &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        const bool entered_seal =
+            concurrent.state.load(std::memory_order_acquire) != EpochBuffer5::State::COLLECTING;
+        const bool premature_drain = concurrent.CanDrainAt(9, 9);
+        const bool late_admission = concurrent.enter_collection(2);
+        if (late_admission) concurrent.exit_collection(2);
+        Embarcadero::PendingBatch5 delayed{};
+        delayed.client_id = 1002;
+        delayed.batch_seq = 43;
+        {
+            std::lock_guard<std::mutex> lock(concurrent.per_broker[1].mu);
+            concurrent.per_broker[1].batches.push_back(delayed);
+        }
+        concurrent.exit_collection(1);
+        sealer.join();
+        Check(entered_seal && seal_succeeded && !premature_drain && !late_admission);
+        Check(concurrent.state.load(std::memory_order_acquire) == EpochBuffer5::State::SEALED);
+        Check(concurrent.CanDrainAt(9, 9));
+        {
+            std::lock_guard<std::mutex> lock(concurrent.per_broker[1].mu);
+            Check(concurrent.per_broker[1].batches.size() == 1);
+            Check(concurrent.per_broker[1].batches.front().batch_seq == 43);
+            concurrent.per_broker[1].batches.clear();
+        }
+        concurrent.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
+        Check(concurrent.reset_and_start());
+        {
+            std::lock_guard<std::mutex> lock(concurrent.per_broker[1].mu);
+            Check(concurrent.per_broker[1].batches.empty());
+        }
         std::cout << "epoch shutdown predicate with retained work passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n'; return 1;
