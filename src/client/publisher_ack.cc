@@ -115,13 +115,13 @@ void Publisher::EpollAckThread() {
 		if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0) {
 			break; // Bind successful
 		}
-		
+
 		if (errno == EADDRINUSE) {
 			// Port in use, try a different port
 			bind_attempts++;
 			ack_port_ = kAckPortMin + (GenerateRandomNum() % kAckPortRange);
 			server_addr.sin_port = htons(ack_port_);
-			LOG(WARNING) << "Port " << (ack_port_ - 1) << " in use, trying port " << ack_port_ 
+			LOG(WARNING) << "Port " << (ack_port_ - 1) << " in use, trying port " << ack_port_
 			             << " (attempt " << bind_attempts << "/" << max_bind_attempts << ")";
 		} else {
 			// Other bind error
@@ -130,7 +130,7 @@ void Publisher::EpollAckThread() {
 			return;
 		}
 	}
-	
+
 	if (bind_attempts >= max_bind_attempts) {
 		LOG(ERROR) << "Failed to bind after " << max_bind_attempts << " attempts";
 		close(server_sock);
@@ -487,7 +487,7 @@ process_client_fd:;
 #endif
 							} else {
 							// Duplicate cumulative value, ignore.
-							VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << 
+							VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id <<
 								") Duplicate ACK messages received: " << session_global_acked;
 						}
 					} else {
@@ -497,7 +497,7 @@ process_client_fd:;
 					// Continue loop to read potentially more data from this socket event
 				}else{
 					LOG(ERROR) << "AckThread: Invalid state for fd " << client_sock;
-					connection_error_or_closed = true; 
+					connection_error_or_closed = true;
 					break;
 				}
 			} // End outer `while (!connection_error_or_closed)` loop for EPOLLET

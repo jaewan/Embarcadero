@@ -309,4 +309,3 @@ void Publisher::CompleteUnackedThrough(int, size_t broker_ack_hwm) {
 		pubQue_.ReleaseBatch(batch);
 	}
 }
-
