@@ -52,15 +52,28 @@ checks. Source5 with a serial audit and a bounded 16 GiB retention allowance
 reported 1052 MiB/s ACK completion and 9.4 GiB client peak RSS. A source14
 client on the source5 broker reported 1013 MiB/s; a source5 client on the
 source14 broker reported 1259 MiB/s. These values point away from audit
-overlap as the sole explanation and toward a possible broker contribution,
-but the uncontrolled run-to-run spread prevents causal attribution. The only
+overlap as the sole explanation, but the uncontrolled run-to-run spread
+prevents causal attribution. The only
 changed broker files between these archives are session admission, session
 publication, and ORDER5 commit; their changes reduce redundant flush or
-locked-RMW work on the hot path. No code-path finding yet explains a 15% ACK
-point-estimate loss, so changing broker logic on this evidence would be
-speculative. Probe artifacts are under `results/refactor-next/2026-09-23/`
+locked-RMW work on the hot path. Probe artifacts are under `results/refactor-next/2026-09-23/`
 with `serial-audit-diagnostic-v1`, `cross-stack-diagnostic-v1`, and
 `reverse-cross-stack-diagnostic-v1` names.
+
+A subsequent fixed common-client experiment used the unchanged source14
+client and serial audit in both arms, varying only the source14/source5 broker.
+Both 8 GiB qualifications and eight measured runs passed exact audit and
+cleanup. Across four balanced pairs, the broker-only source5/source14
+geometric ratios were 1.048 for audited end to end (descriptive 95% interval
+0.879–1.250) and 1.168 for ACK completion (0.709–1.924). ACK pair ratios
+ranged from 0.738 to 1.454. This does not establish broker improvement or
+5% nonregression, but it does not support treating the earlier single-run
+cross-stack values as proof of a broker regression. The prior socket-send
+intervention also had zero EAGAIN/writable waits and a wide null interval;
+the variable send/kernel path remains unresolved. No code-path finding yet
+explains the whole-stack ACK point estimate, so changing broker logic to
+chase it would be speculative. Raw evidence is under
+`results/refactor-next/2026-09-23/common-client8g-broker-only-v1/`.
 
 Later on 2026-09-23, the host exposed memory-only NUMA node 2 again (about
 258 GiB free), and `/proc/iomem` showed `CXL Window 0`. The owned runner now
