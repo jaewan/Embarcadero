@@ -73,10 +73,12 @@ latency/gap/publisher workloads. On this host `/dev/dax0.0` is absent, so the
 real backend uses the shared-memory fallback bound to node 2; the runner does
 not establish a PCI device identity.
 
-One audited 32 MiB physical-mode smoke and the 1024 × 8 B indexed gap and
-256 × 16 B latency workloads passed on node 2, with exact delivery checks,
-zero exits, and owned cleanup. The smoke's sampled mapping had all 16,777,216
-4 KiB pages on node 2. Artifacts are under
+Audited one- and three-broker 32 MiB physical-mode smokes and the
+1024 × 8 B indexed gap and 256 × 16 B latency workloads passed on node 2,
+with exact delivery checks, zero exits, and owned cleanup. The three-broker
+smoke used automatic address selection; all brokers mapped at
+`0x600000000000`, and each sampled mapping had all 16,777,216 4 KiB pages
+on node 2. Artifacts are under
 `results/refactor-next/2026-09-23/cxl-live/`. This qualifies those finite
 correctness cells and placement, not a physical CXL throughput comparison or
 final paper performance claim. The public storage contract remains bounded

@@ -573,7 +573,7 @@ def main(argv=None, *, profile=None):
                 verify_executed_binary(child, broker, manifest["binaries"][str(broker)], evidence)
                 manifest["placement"][name] = placement_snapshot(child,
                     hardware["nodes"]["1"]["cpus"], 2 if args.physical_cxl else 1,
-                    run_dir, name, shm_name if broker_id == 0 else None)
+                    run_dir, name, shm_name if broker_id == 0 or args.physical_cxl else None)
                 if args.physical_cxl and broker_id == 0:
                     broker_log = (run_dir / f"{name}.log").read_text(errors="replace")
                     if "CXL region bound to NUMA node 2" not in broker_log:
