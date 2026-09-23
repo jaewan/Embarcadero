@@ -119,6 +119,7 @@ class RemotePublishers:
         self.evidence = {}
         self.children = {}
         self.launched = set()
+        self.go_ns = None
 
     def prepare(self, config, env, selected, manifest, _hardware, common, _run_dir):
         if common.brokers != 4 or not common.physical_cxl:
@@ -287,6 +288,7 @@ class RemotePublishers:
             for p in self.publishers:
                 self.verify(p)
             go_ns = time.time_ns() + 2_000_000_000
+            self.go_ns = go_ns
             for p in self.publishers:
                 ssh(p.host, f"printf '%s\\n' {go_ns} > " + shlex.quote(self.directories[p.host] + "/go"))
             manifest.update(status="running", remote_evidence=self.evidence, remote_go_wall_ns=go_ns)
@@ -320,19 +322,27 @@ class RemotePublishers:
         for p in self.publishers:
             log = (run_dir / ("remote-" + p.host + ".log")).read_text(errors="replace")
             result = ack_and_routing(log, p.payload_bytes // 4096, range(4), 60000)
+            if self.options.hugetlb and len(re.findall(r"MAP_HUGETLB success for \d+ bytes", log)) != 1:
+                raise dev.RunError(p.host + ": requested HugeTLB mapping was not confirmed")
+            barriers = re.findall(r"Push-ready barrier: go_ns=(\d+)", log)
             starts = re.findall(r"Publisher push start \(wall ns\): (\d+)", log)
             durations = re.findall(r"Publish test completed in ([0-9.]+) seconds", log)
-            if len(starts) != 1 or len(durations) != 1 or float(durations[0]) <= 0:
+            if (len(barriers) != 1 or len(starts) != 1 or len(durations) != 1 or
+                    float(durations[0]) <= 0 or (self.go_ns is not None and int(barriers[0]) != self.go_ns) or
+                    int(starts[0]) < int(barriers[0])):
                 raise dev.RunError(p.host + ": missing one complete timing record")
             result.update(host=p.host, start_wall_ns=int(starts[0]), duration_seconds=float(durations[0]))
             rows.append(result)
         routed = {broker: sum(row["sent_by_broker"].get(broker, 0) for row in rows) for broker in range(4)}
         if any(count <= 0 for count in routed.values()):
             raise dev.RunError("not every broker received publisher traffic")
+        if len({row["client_id"] for row in rows}) != len(rows):
+            raise dev.RunError("independent remote publisher sessions collided")
         start = min(row["start_wall_ns"] for row in rows)
         end = max(row["start_wall_ns"] + round(row["duration_seconds"] * 1e9) for row in rows)
         seconds = (end - start) / 1e9
         return {"clients": rows, "sent_by_broker": routed,
+                "observed_publish_start_spread_ns": max(row["start_wall_ns"] for row in rows) - start,
                 "total_payload_bytes": sum(p.payload_bytes for p in self.publishers),
                 "complete_transfer_seconds_approx": seconds,
                 "ack_completion_decimal_gb_s_approx": sum(p.payload_bytes for p in self.publishers) / seconds / 1e9,

@@ -62,11 +62,30 @@ class RemoteProfileTests(unittest.TestCase):
                     f"[ORDER5_ROUTING] client_id={identity} retransmit_attempts=0 session_fenced_observed=0 "
                     f"session_rto_min_ms=60000 broker0_msgs={count//4} broker1_msgs={count//4} "
                     f"broker2_msgs={count//4} broker3_msgs={count//4}\n"
+                    "Push-ready barrier: go_ns=1000000000\n"
                     "Publisher push start (wall ns): 1000000000\nPublish test completed in 1.00 seconds\n")
             self.assertEqual(workload.validate(base)["total_payload_bytes"], 2 * dev.GIB)
             path = base / "remote-c1.log"
             path.write_text(path.read_text().replace("session_fenced_observed=0", "session_fenced_observed=1"))
             with self.assertRaises(dev.RunError):
+                workload.validate(base)
+            path.write_text(path.read_text().replace("session_fenced_observed=1", "session_fenced_observed=0")
+                            .replace("client_id=71", "client_id=72"))
+            with self.assertRaisesRegex(dev.RunError, "sessions collided"):
+                workload.validate(base)
+
+    def test_hugetlb_request_requires_observed_mapping(self):
+        options, _, local = self.options("--hugetlb")
+        workload = remote.RemotePublishers(options, local)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for host in ("c1", "c3"):
+                (base / f"remote-{host}.log").write_text(
+                    f"[ACK_VERIFY] normalized_received={dev.GIB//4096} raw_received=0 "
+                    f"target={dev.GIB//4096} 100%\n"
+                    f"[ORDER5_ROUTING] client_id=1 retransmit_attempts=0 session_fenced_observed=0 "
+                    f"session_rto_min_ms=60000 broker0_msgs={dev.GIB//4096}\n")
+            with self.assertRaisesRegex(dev.RunError, "HugeTLB mapping was not confirmed"):
                 workload.validate(base)
 
 
