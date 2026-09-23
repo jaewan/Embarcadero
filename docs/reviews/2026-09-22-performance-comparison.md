@@ -70,11 +70,11 @@ The revised local runner passes `EMBARCADERO_CXL_BASE_ADDR=0x400000000000` to ev
 
 ## Evidence and reproduction
 
-- [Separate profile results](../../results/refactor-perf/2026-09-22/profile-results.json), [all qualified-profile trials](../../results/refactor-perf/2026-09-22/trials.csv), and [resource summaries](../../results/refactor-perf/2026-09-22/resource-summary.json).
-- [One-broker index](../../results/refactor-perf/2026-09-22/n1-v2-run2/index.json) and [three-broker index](../../results/refactor-perf/2026-09-22/n3-v3/index.json) link to every manifest and raw log. [Campaign inventory](../../results/refactor-perf/2026-09-22/campaign-inventory.json) also identifies retained failed attempts.
+- `../../results/refactor-perf/2026-09-22/profile-results.json`, `../../results/refactor-perf/2026-09-22/trials.csv`, and `../../results/refactor-perf/2026-09-22/resource-summary.json`.
+- `../../results/refactor-perf/2026-09-22/n1-v2-run2/index.json` and `../../results/refactor-perf/2026-09-22/n3-v3/index.json` link to every manifest and raw log. `../../results/refactor-perf/2026-09-22/campaign-inventory.json` also identifies retained failed attempts.
 - `build-evidence/` contains the compiled candidate source archive, source hashes, patch, matched configure/build logs, dependency/ISA evidence, and exact harness revisions/amendments. Broker/client binaries stayed unchanged throughout the comparisons. Files under `/tmp` are supplementary and may be removed by host cleanup; repository-local evidence is git-ignored and must be packaged deliberately for release.
 
-After the campaigns, the two new tooling test suites were registered with CTest. The final suite passed **40/40**, including 28 Python tooling cases across three entries. [Final verification](../../results/refactor-perf/2026-09-22/final-verification.json) records no production source drift, the post-measurement test-registration-only build-input change, and cleanup of all 45 owned regions from the attempted campaigns, with no recorded broker/client process remaining.
+After the campaigns, the two new tooling test suites were registered with CTest. The final suite passed **40/40**, including 28 Python tooling cases across three entries. `../../results/refactor-perf/2026-09-22/final-verification.json` records no production source drift, the post-measurement test-registration-only build-input change, and cleanup of all 45 owned regions from the attempted campaigns, with no recorded broker/client process remaining.
 
 Recompute each profile independently:
 

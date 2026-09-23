@@ -7,6 +7,10 @@ Earlier source09 results remain separate historical evidence.
 
 Design, evaluation, and operational documentation for Embarcadero.
 
+Review notes sometimes name local `results/` or separately managed `Paper/`
+artifacts. Those paths are identifiers, not files in a public checkout; see
+the [tracked paired summaries and evidence limits](reviews/evidence/README.md).
+
 ## Start here
 
 - [Build and dependency bootstrap](development-build.md)

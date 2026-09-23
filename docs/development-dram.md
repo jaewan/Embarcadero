@@ -40,7 +40,7 @@ Test orchestration without allocating a real region:
 python3 tools/test_dev_cluster.py
 ```
 
-The fake-executable tests cover explicit emulation propagation, environment isolation, occupied-port rejection, serialization, dry run, successful cleanup, startup failure, and stubborn-child termination while an unrelated process survives. Optional remote clients and the real-CXL profile are deferred; local development does not depend on `ssh c1`, `ssh c3`, or `ssh c4`.
+The fake-executable tests cover explicit emulation propagation, environment isolation, occupied-port rejection, serialization, dry run, successful cleanup, startup failure, and stubborn-child termination while an unrelated process survives. Optional remote clients remain separate; local development does not depend on `ssh c1`, `ssh c3`, or `ssh c4`. The runner also has a `--physical-cxl` NUMA-node-2 placement profile. It requires the real backend's shared-memory fallback and verifies node-2 residency; it does not identify a PCI CXL device or qualify physical-CXL throughput. See the [recorded finite checks](reviews/2026-09-23-workload-followup.md).
 
 An optional live regression checks legacy ORDER0/ACK1 startup, which must establish its ACK connection without waiting for session negotiation:
 

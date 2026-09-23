@@ -2,20 +2,21 @@
 
 **A distributed shared log over CXL disaggregated memory.**
 
-Embarcadero is a totally-ordered publish/subscribe shared log that exploits CXL disaggregated
-memory to break the classic ordering-vs-throughput tradeoff. Log servers append payloads to
-per-server logs in shared memory and publish 64-byte metadata records; a sequencer polls those
-records over memory loads, assigns global order, and uses a bounded hold buffer to preserve
-per-client FIFO and ack ordering — without moving the sequencer onto the write path. It remains
-correct on non-coherent CXL 2.0 hardware via single-writer ownership, monotonic updates, and
-poll-based state transitions.
+Embarcadero is a totally ordered publish/subscribe shared log designed for CXL
+disaggregated memory. Brokers append payloads to per-broker logs in shared memory;
+a sequencer observes progress records and assigns global order without receiving
+the payload. The supported ORDER5 profile is a bounded, single-host research
+prototype: it retains primary-log data and stops admission at capacity. Brokers
+require the same virtual mapping address because some shared records still
+contain process pointers.
 
-On a CXL 2.0 testbed, Embarcadero reaches **18.2 GB/s** append throughput under strong total
-ordering (2.2× Scalog, 2.3× LazyLog, 2.8× Corfu) with **1.6 ms P99** append latency.
-
-> Research prototype accompanying the paper in [`Paper/Text/`](Paper/Text/). See
-> [`docs/design/EMBARCADERO_DEFINITIVE_DESIGN.md`](docs/design/EMBARCADERO_DEFINITIVE_DESIGN.md)
-> for the full design.
+The paper's CXL performance results describe its evaluated snapshot and hardware.
+The refactored code has passed finite local DRAM and NUMA-node-2 correctness checks,
+but its one-broker throughput nonregression and physical-CXL performance remain
+unqualified. See the [supported modes](docs/support-matrix.md),
+[latest paired measurements](docs/reviews/2026-09-23-workload-followup.md), and
+[evidence availability](docs/reviews/evidence/README.md). The manuscript in
+`Paper/Text/` is managed separately and is not part of this checkout.
 
 ## Repository layout
 
@@ -28,51 +29,40 @@ ordering (2.2× Scalog, 2.3× LazyLog, 2.8× Corfu) with **1.6 ms P99** append l
 | `scripts/` | Experiment launchers, cluster setup, plotting — see [`scripts/README.md`](scripts/README.md). |
 | `docs/` | Design, evaluation, and operational docs — see [`docs/README.md`](docs/README.md). |
 | `results/` | Generated experiment output (git-ignored). |
-| `Paper/` | LaTeX manuscript (managed separately, git-ignored). |
+| `Paper/` | Separately managed LaTeX manuscript; absent from public checkouts. |
 
 ## Build
 
-Requires Linux/x86-64 with a C++17 compiler and CMake ≥ 3.20. Dependencies: gRPC/Protobuf
-(fetched by CMake), plus Folly, glog, gflags, mimalloc, yaml-cpp, cxxopts, Abseil (installed by
-the setup script).
+Requires Linux/x86-64, C++17, CMake ≥ 3.20, Ninja, and the dependencies in the
+[build guide](docs/development-build.md). Use its disposable Ubuntu 24.04
+bootstrap for a clean dependency environment.
 
 ```bash
-# 1. Install dependencies (run once, from the repo root)
-scripts/setup/setup_dependencies.sh
-
-# 2. Configure & build
-cmake -S . -B build
-cmake --build build -j
-
-# Binaries are written to build/bin/ (embarlet, throughput_test, kv_ycsb_bench,
-# *_global_sequencer, config_test, ...).
-
-# 3. Grant capabilities needed for cgroups / CXL (once per binary)
-sudo setcap cap_sys_admin,cap_dac_override,cap_dac_read_search=eip build/bin/embarlet
+cmake --preset debug
+cmake --build --preset debug -j 8
+ctest --preset debug
 ```
 
 ## Run
 
-The first broker started is the **head node** (a rendezvous point for broker discovery):
+For a local, owned DRAM smoke on a host with NUMA nodes 0 and 1, run:
 
 ```bash
-# Head broker
-build/bin/embarlet --head
-
-# Additional brokers
-build/bin/embarlet --follower 'ADDR:PORT'   # or just --follower to auto-discover
+python3 tools/dev_cluster.py --build-dir build/debug --dry-run
+python3 tools/dev_cluster.py --build-dir build/debug
 ```
 
-Cluster experiments (throughput, latency, failures, multi-client) are driven by the scripts in
-`scripts/` — most are environment-variable configured. See [`scripts/README.md`](scripts/README.md).
-
-## Test
-
-```bash
-ctest --test-dir build --output-on-failure
-```
+The [local development guide](docs/development-dram.md) gives prerequisites,
+resource requirements, a three-broker run, and cleanup behavior. Research
+launchers have different host assumptions; consult [their inventory](scripts/README.md)
+before using them.
 
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for branch conventions, the build/test loop, formatting,
 and the "no generated data in git" rule.
+
+## License
+
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party material
+retains its own licenses and notices.

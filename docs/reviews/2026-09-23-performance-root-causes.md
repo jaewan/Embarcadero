@@ -176,8 +176,8 @@ prelaunch path digests, commands and build derivations, not a live `/proc/PID/ex
 inode attestation for these diagnostic runs. An earlier controller-affinity preflight failed before starting
 a cluster; that attempt remains retained. Timer/build/oracle changes were
 independently cross-reviewed. Evidence and reproducible scripts are in
-[the artifact guide](../../results/refactor-root-cause/2026-09-23/README.md), with
-[detailed broker-path review](../../results/refactor-root-cause/2026-09-23/broker-code-path-review.md),
-[client-path review](../../results/refactor-root-cause/2026-09-23/client-path-review.md),
-[initial four-run data](../../results/refactor-root-cause/2026-09-23/abba-instrumented-v2/diagnostic-analysis.json),
-and [controlled schedule data](../../results/refactor-root-cause/2026-09-23/audit-schedule-contrast/contrast-summary.json).
+`../../results/refactor-root-cause/2026-09-23/README.md`, with
+`../../results/refactor-root-cause/2026-09-23/broker-code-path-review.md`,
+`../../results/refactor-root-cause/2026-09-23/client-path-review.md`,
+`../../results/refactor-root-cause/2026-09-23/abba-instrumented-v2/diagnostic-analysis.json`,
+and `../../results/refactor-root-cause/2026-09-23/audit-schedule-contrast/contrast-summary.json`.

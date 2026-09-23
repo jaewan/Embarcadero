@@ -44,8 +44,9 @@ unstable. The preregistered 32-pair gate therefore has low prospective power
 and has not been launched. The source5 client reduced median peak RSS from
 about 7.5 GiB to 0.59 GiB by streaming its exact audit; this changes concurrent
 work relative to source14's serial audit. It does not establish throughput
-equivalence. Raw manifests, analyzer, and source/build evidence are under
-`results/refactor-next/2026-09-23/long8g-pilot-rebuilt-v3/`.
+equivalence. The [paired measurements](evidence/2026-09-23-long8g-pilot-analysis.json)
+are tracked; raw manifests, analyzer, and source/build evidence remain in the
+local-only `results/refactor-next/2026-09-23/long8g-pilot-rebuilt-v3/` archive.
 
 Three single-run causal probes all passed exact audit, identity, and cleanup
 checks. Source5 with a serial audit and a bounded 16 GiB retention allowance
@@ -72,8 +73,9 @@ cross-stack values as proof of a broker regression. The prior socket-send
 intervention also had zero EAGAIN/writable waits and a wide null interval;
 the variable send/kernel path remains unresolved. No code-path finding yet
 explains the whole-stack ACK point estimate, so changing broker logic to
-chase it would be speculative. Raw evidence is under
-`results/refactor-next/2026-09-23/common-client8g-broker-only-v1/`.
+chase it would be speculative. The [broker-only paired measurements](evidence/2026-09-23-common-client-broker-analysis.json)
+are tracked; raw evidence remains in the local-only
+`results/refactor-next/2026-09-23/common-client8g-broker-only-v1/` archive.
 
 Later on 2026-09-23, the host exposed memory-only NUMA node 2 again (about
 258 GiB free), and `/proc/iomem` showed `CXL Window 0`. The owned runner now

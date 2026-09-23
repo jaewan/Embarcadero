@@ -41,10 +41,10 @@ same audited smoke.
 
 All three profiles passed bounded live acceptance on source 14, including
 publishers with the supported `0;0,1,2` destination sets. The
-[final independent audit](../results/refactor-followup/2026-09-22/independent-source14-workload-audit.json)
+`../results/refactor-followup/2026-09-22/independent-source14-workload-audit.json`
 checks actual executable identities, completion and owned cleanup. The earlier
 follower-only publisher failure remains in the
-[original audit](../results/refactor-followup/2026-09-22/independent-owned-workload-audit.json).
+`../results/refactor-followup/2026-09-22/independent-owned-workload-audit.json`.
 These profiles reuse the smoke runner's broker startup, lock, 64 GiB region,
 NUMA placement and owned cleanup.
 Each uses ORDER5/ACK1/RF0, 4 KiB messages and 1–32 MiB per process, with at most

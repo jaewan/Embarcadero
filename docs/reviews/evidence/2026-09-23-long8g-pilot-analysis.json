@@ -1,0 +1,267 @@
+{
+  "status": "passed",
+  "qualification_claim": false,
+  "purpose": "Estimate8GiB paired dispersion only; not the32-pair gate.",
+  "trials": 10,
+  "excluded_qualifications": 2,
+  "measurement_pairs": 4,
+  "metrics": {
+    "audit_inclusive_e2e_mib_s": {
+      "pairs": [
+        {
+          "baseline": 929.559,
+          "candidate": 1116.366,
+          "ratio": 1.2009630373112412
+        },
+        {
+          "baseline": 921.027,
+          "candidate": 918.327,
+          "ratio": 0.9970684898488318
+        },
+        {
+          "baseline": 1027.366,
+          "candidate": 1070.501,
+          "ratio": 1.0419860108276895
+        },
+        {
+          "baseline": 1183.662,
+          "candidate": 979.193,
+          "ratio": 0.827257274458418
+        }
+      ],
+      "geometric_mean_ratio": 1.0079506725211187,
+      "descriptive_ci95": [
+        0.789163010659484,
+        1.2873950559172294
+      ],
+      "paired_log_ratio_sd": 0.15378208103577728,
+      "normal_approx_pairs_for_80pct_power_at_true_ratio1": 71,
+      "qualification_claim": false,
+      "interpretation": "Exploratory dispersion only; SD and planning calculation unstable with four pairs."
+    },
+    "ack_completion_mib_s": {
+      "pairs": [
+        {
+          "baseline": 1517.996,
+          "candidate": 1119.439,
+          "ratio": 0.7374452897109083
+        },
+        {
+          "baseline": 1386.122,
+          "candidate": 952.95,
+          "ratio": 0.687493597244687
+        },
+        {
+          "baseline": 1477.312,
+          "candidate": 1435.202,
+          "ratio": 0.9714955270112204
+        },
+        {
+          "baseline": 1242.661,
+          "candidate": 1302.332,
+          "ratio": 1.0480187275532105
+        }
+      ],
+      "geometric_mean_ratio": 0.8476217225634661,
+      "descriptive_ci95": [
+        0.6110646703134797,
+        1.1757553978581057
+      ],
+      "paired_log_ratio_sd": 0.20564787338442475,
+      "normal_approx_pairs_for_80pct_power_at_true_ratio1": 127,
+      "qualification_claim": false,
+      "interpretation": "Exploratory dispersion only; SD and planning calculation unstable with four pairs."
+    }
+  },
+  "raw_measurements": [
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "metrics": {
+        "ack_completion_mib_s": 1517.996,
+        "audit_inclusive_e2e_mib_s": 929.559
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 6459342848,
+        "minor_faults": 1589405,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 11.966138,
+        "user_seconds": 3.733634
+      },
+      "phases_ms": {
+        "queue_drain_ms": 1.331,
+        "publisher_join_ms": 0.251,
+        "ack_wait_ms": 325.458,
+        "post_ack_ms": 0.113,
+        "total_poll_ms": 327.154
+      }
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "metrics": {
+        "ack_completion_mib_s": 1119.439,
+        "audit_inclusive_e2e_mib_s": 1116.366
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 595623936,
+        "minor_faults": 143545,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 9.744197,
+        "user_seconds": 7.196487
+      },
+      "phases_ms": {
+        "queue_drain_ms": 2.291,
+        "publisher_join_ms": 0.353,
+        "ack_wait_ms": 422.428,
+        "post_ack_ms": 0.175,
+        "total_poll_ms": 425.249
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "metrics": {
+        "ack_completion_mib_s": 952.95,
+        "audit_inclusive_e2e_mib_s": 918.327
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 587292672,
+        "minor_faults": 162083,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 12.349128,
+        "user_seconds": 8.976102
+      },
+      "phases_ms": {
+        "queue_drain_ms": 2.072,
+        "publisher_join_ms": 0.222,
+        "ack_wait_ms": 518.354,
+        "post_ack_ms": 0.185,
+        "total_poll_ms": 520.834
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "metrics": {
+        "ack_completion_mib_s": 1386.122,
+        "audit_inclusive_e2e_mib_s": 921.027
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 7235219456,
+        "minor_faults": 1775920,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 12.52863,
+        "user_seconds": 4.647337
+      },
+      "phases_ms": {
+        "queue_drain_ms": 1.324,
+        "publisher_join_ms": 0.221,
+        "ack_wait_ms": 330.562,
+        "post_ack_ms": 0.125,
+        "total_poll_ms": 332.233
+      }
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "metrics": {
+        "ack_completion_mib_s": 1477.312,
+        "audit_inclusive_e2e_mib_s": 1027.366
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 7822450688,
+        "minor_faults": 1925028,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 12.1408,
+        "user_seconds": 4.048629
+      },
+      "phases_ms": {
+        "queue_drain_ms": 1.231,
+        "publisher_join_ms": 0.27,
+        "ack_wait_ms": 330.085,
+        "post_ack_ms": 0.128,
+        "total_poll_ms": 331.715
+      }
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "metrics": {
+        "ack_completion_mib_s": 1435.202,
+        "audit_inclusive_e2e_mib_s": 1070.501
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 591482880,
+        "minor_faults": 161371,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 8.897566,
+        "user_seconds": 8.183589
+      },
+      "phases_ms": {
+        "queue_drain_ms": 0.849,
+        "publisher_join_ms": 0.329,
+        "ack_wait_ms": 358.161,
+        "post_ack_ms": 0.168,
+        "total_poll_ms": 359.509
+      }
+    },
+    {
+      "pair": 4,
+      "variant": "candidate",
+      "metrics": {
+        "ack_completion_mib_s": 1302.332,
+        "audit_inclusive_e2e_mib_s": 979.193
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 587300864,
+        "minor_faults": 162236,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 9.563548,
+        "user_seconds": 8.818713
+      },
+      "phases_ms": {
+        "queue_drain_ms": 0.903,
+        "publisher_join_ms": 0.284,
+        "ack_wait_ms": 346.955,
+        "post_ack_ms": 0.179,
+        "total_poll_ms": 348.322
+      }
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "metrics": {
+        "ack_completion_mib_s": 1242.661,
+        "audit_inclusive_e2e_mib_s": 1183.662
+      },
+      "client_rusage": {
+        "major_faults": 0,
+        "max_rss_bytes": 9638592512,
+        "minor_faults": 2354883,
+        "scope": "complete client lifetime, including initialization and payload audit",
+        "system_seconds": 13.568561,
+        "user_seconds": 3.343257
+      },
+      "phases_ms": {
+        "queue_drain_ms": 1.252,
+        "publisher_join_ms": 0.246,
+        "ack_wait_ms": 498.792,
+        "post_ack_ms": 0.12,
+        "total_poll_ms": 500.411
+      }
+    }
+  ],
+  "limits": [
+    "Whole-stack serial baseline versus streaming candidate; not isolated broker inference.",
+    "Four-pair variance estimate is noisy; no post hoc sample addition.",
+    "Longer duration does not eliminate kernel-path or environmental variability."
+  ]
+}
